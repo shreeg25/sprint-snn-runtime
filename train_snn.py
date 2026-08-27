@@ -1,6 +1,52 @@
+import os
+import sys
 import torch
 import torch.nn as nn
+import snntorch as snn
+from snntorch import surrogate
+from torch.utils.data import DataLoader, Dataset
+import torch.optim as optim
+import numpy as np
 
+def log_status(msg):
+    sys.stdout.write(f"[RUNNING] {msg}\n")
+    sys.stdout.flush()
+
+# --- 1. SNN Architecture (Hypersensitive LIF) ---
+class WearableSNN(nn.Module):
+    def __init__(self, num_inputs=1, num_hidden=32, num_outputs=2):
+        super(WearableSNN, self).__init__()
+        
+        spike_grad = surrogate.fast_sigmoid(slope=25)
+        
+        self.fc1 = nn.Linear(num_inputs, num_hidden)
+        # Dropped threshold to 0.2, increased beta to 0.9 to prevent leak death
+        self.lif1 = snn.Leaky(beta=0.9, threshold=0.2, spike_grad=spike_grad)
+        
+        self.fc2 = nn.Linear(num_hidden, num_outputs)
+        self.lif2 = snn.Leaky(beta=0.9, threshold=0.2, spike_grad=spike_grad)
+
+    def forward(self, x):
+        mem1 = self.lif1.init_leaky()
+        mem2 = self.lif2.init_leaky()
+        
+        spk2_rec = []
+        mem2_rec = []
+
+        for step in range(x.size(0)):
+            # Amplify the input current to force early activity
+            cur1 = self.fc1(x[step]) * 5.0 
+            spk1, mem1 = self.lif1(cur1, mem1)
+            
+            cur2 = self.fc2(spk1) * 5.0
+            spk2, mem2 = self.lif2(cur2, mem2)
+            
+            spk2_rec.append(spk2)
+            mem2_rec.append(mem2)
+
+        return torch.stack(spk2_rec, dim=0), torch.stack(mem2_rec, dim=0)
+    
+# --- 2. Temporal Distillation Loss ---
 class TemporalDistillationLoss(nn.Module):
     def __init__(self, temporal_penalty_gamma=0.01):
         super(TemporalDistillationLoss, self).__init__()
@@ -8,126 +54,90 @@ class TemporalDistillationLoss(nn.Module):
         self.gamma = temporal_penalty_gamma
 
     def forward(self, spike_trains, targets):
-        """
-        spike_trains shape: [time_steps, batch_size, num_classes]
-        targets shape: [batch_size]
-        """
         T, B, C = spike_trains.shape
-        
-        # 1. Base Classification Loss (Rate Coding Baseline)
-        # We sum the spikes over the entire window to see if it guessed right
         spike_count = spike_trains.sum(dim=0) 
         loss_ce = self.ce_loss(spike_count, targets)
         
-        # 2. The Research Contribution: Temporal Penalty
-        # Create a time vector: [1, 2, 3, ..., T]
-        time_vector = torch.arange(1, T + 1, dtype=torch.float32, device=spike_trains.device)
-        time_vector = time_vector.view(T, 1, 1) # Reshape for broadcasting against spikes
-        
-        # Multiply every spike by the exact time step it occurred. 
-        # A spike at t=90 gets punished 9x harder than a spike at t=10.
+        time_vector = torch.arange(1, T + 1, dtype=torch.float32, device=spike_trains.device).view(T, 1, 1) 
         late_spike_penalty = torch.sum(spike_trains * time_vector) / B
         
-        # 3. Total Loss
-        total_loss = loss_ce + (self.gamma * late_spike_penalty)
-        
-        return total_loss, loss_ce, late_spike_penalty
+        return loss_ce + (self.gamma * late_spike_penalty), loss_ce, late_spike_penalty
 
-import snntorch as snn
-from snntorch import surrogate
-from torch.utils.data import DataLoader, TensorDataset
-import torch.optim as optim
-
-# --- 1. SNN Architecture Definition ---
-class WearableSNN(nn.Module):
-    def __init__(self, num_inputs=1, num_hidden=32, num_outputs=2):
-        super(WearableSNN, self).__init__()
+# --- 3. Zero-Network Learnable Dataset ---
+class SyntheticECGDataset(Dataset):
+    def __init__(self, num_samples=300, window_size=100, threshold=0.15):
+        log_status("Synthesizing learnable mathematical ECG dataset in memory...")
+        self.data, self.labels = [], []
         
-        # Surrogate gradient for backprop through discrete spikes
-        spike_grad = surrogate.fast_sigmoid(slope=25)
-        
-        # Synaptic layers
-        self.fc1 = nn.Linear(num_inputs, num_hidden)
-        self.lif1 = snn.Leaky(beta=0.8, spike_grad=spike_grad)
-        
-        self.fc2 = nn.Linear(num_hidden, num_outputs)
-        self.lif2 = snn.Leaky(beta=0.8, spike_grad=spike_grad)
-
-    def forward(self, x):
-        """
-        x shape: [time_steps, batch_size, features]
-        """
-        mem1 = self.lif1.init_leaky()
-        mem2 = self.lif2.init_leaky()
-        
-        spk2_rec = []
-        mem2_rec = []
-
-        # Iterate through time steps
-        for step in range(x.size(0)):
-            cur1 = self.fc1(x[step])
-            spk1, mem1 = self.lif1(cur1, mem1)
+        for _ in range(num_samples):
+            label = np.random.choice([0, 1])
+            t = np.linspace(0, 1, window_size)
+            signal = np.random.normal(0, 0.02, window_size) # Base biological noise
             
-            cur2 = self.fc2(spk1)
-            spk2, mem2 = self.lif2(cur2, mem2)
-            
-            spk2_rec.append(spk2)
-            mem2_rec.append(mem2)
+            if label == 0:
+                # Normal Beat: Sharp, early peak
+                signal += 1.2 * np.exp(-((t - 0.3) ** 2) / (2 * 0.01 ** 2))
+            else:
+                # Arrhythmia: Inverted, delayed, wide peak
+                signal -= 0.8 * np.exp(-((t - 0.6) ** 2) / (2 * 0.04 ** 2))
+                
+            # Delta Modulate
+            spikes = np.zeros_like(signal)
+            ref = signal[0]
+            for i in range(1, len(signal)):
+                diff = signal[i] - ref
+                if diff > threshold:
+                    spikes[i] = 1; ref = signal[i]
+                elif diff < -threshold:
+                    spikes[i] = -1; ref = signal[i]
+                    
+            self.data.append(torch.tensor(spikes, dtype=torch.float32).unsqueeze(-1))
+            self.labels.append(torch.tensor(label, dtype=torch.long))
 
-        return torch.stack(spk2_rec, dim=0), torch.stack(mem2_rec, dim=0)
+    def __len__(self): return len(self.data)
+    def __getitem__(self, idx): return self.data[idx], self.labels[idx]
 
-# --- 2. Synthetic Data Loader (Replace with real MIT-BIH tensors later) ---
-def get_synthetic_dataloader(time_steps=100, batch_size=16, samples=128):
-    # Random binary spikes: [T, Batch, Features]
-    X = torch.randint(0, 2, (time_steps, samples, 1), dtype=torch.float32)
-    # Binary targets (0: Normal, 1: Arrhythmia)
-    y = torch.randint(0, 2, (samples,), dtype=torch.long) 
-    
-    dataset = TensorDataset(X.transpose(0, 1), y) # Transpose to [Batch, T, Features]
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-# --- 3. The Execution Loop ---
+# --- 4. Execution Engine ---
 if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[*] Executing on: {device}")
+    device = torch.device("cpu")
+    log_status(f"Execution Engine: {device.type.upper()}")
 
-    # Hyperparameters
     TIME_STEPS = 100
-    EPOCHS = 5
+    EPOCHS = 10 # Increased to 10 to watch the gradual convergence
     
     model = WearableSNN().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = optim.Adam(model.parameters(), lr=2e-3)
+    criterion = TemporalDistillationLoss(temporal_penalty_gamma=0.08) # Stronger penalty for visibility
     
-    # Instantiate your custom loss function
-    criterion = TemporalDistillationLoss(temporal_penalty_gamma=0.05)
-    
-    dataloader = get_synthetic_dataloader(time_steps=TIME_STEPS)
-
-    print("[*] Initiating Temporal Distillation Training...")
+    dataloader = DataLoader(SyntheticECGDataset(window_size=TIME_STEPS), batch_size=16, shuffle=True)
+    log_status("Initiating Temporal Distillation SNN Training on Synthesized Features...")
     
     for epoch in range(EPOCHS):
-        total_loss = 0
+        total_loss, total_penalty, correct, total = 0, 0, 0, 0
         model.train()
         
-        for batch_idx, (data, targets) in enumerate(dataloader):
-            data = data.transpose(0, 1).to(device) # Reshape back to [T, Batch, Features]
-            targets = targets.to(device)
-            
-            # Forward Pass
+        for data, targets in dataloader:
+            data, targets = data.transpose(0, 1).to(device), targets.to(device)
             spk_rec, _ = model(data)
             
-            # Calculate Total Loss + Late Spike Penalty
             loss, ce, late_penalty = criterion(spk_rec, targets)
             
-            # Backpropagation
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             
             total_loss += loss.item()
+            total_penalty += late_penalty.item()
             
-        print(f"Epoch {epoch+1}/{EPOCHS} | Total Loss: {total_loss:.4f}")
+            # Calculate rough accuracy
+            _, predicted = spk_rec.sum(dim=0).max(1)
+            total += targets.size(0)
+            correct += (predicted == targets).sum().item()
+            
+        acc = 100. * correct / total
+        print(f"Epoch {epoch+1:02d}/{EPOCHS} | Loss: {total_loss:.4f} | Penalty: {total_penalty:.4f} | Accuracy: {acc:.1f}%")
 
-    # --- 4. Extract the Physical Silicon State ---
-    torch.save(model.state_dict(), 'models/distilled_snn_weights.pt')
-    print("[+] Weights heavily biased for early TTFS extracted to models/distilled_snn_weights.pt")
+    os.makedirs("models", exist_ok=True)
+    save_path = 'models/distilled_snn_weights.pt'
+    torch.save(model.state_dict(), save_path)
+    log_status(f"SUCCESS: Hardware SNN weights extracted to {save_path}")
