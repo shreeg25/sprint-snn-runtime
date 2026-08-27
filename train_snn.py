@@ -107,7 +107,8 @@ if __name__ == "__main__":
     
     model = WearableSNN().to(device)
     optimizer = optim.Adam(model.parameters(), lr=2e-3)
-    criterion = TemporalDistillationLoss(temporal_penalty_gamma=0.08) # Stronger penalty for visibility
+    # The final mathematical balance
+    criterion = TemporalDistillationLoss(temporal_penalty_gamma=0.0001)
     
     dataloader = DataLoader(SyntheticECGDataset(window_size=TIME_STEPS), batch_size=16, shuffle=True)
     log_status("Initiating Temporal Distillation SNN Training on Synthesized Features...")
