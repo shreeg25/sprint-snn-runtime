@@ -4,54 +4,54 @@ import torch
 import torch.nn as nn
 import snntorch as snn
 from snntorch import surrogate
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 import torch.optim as optim
+import wfdb
 import numpy as np
+from sklearn.metrics import recall_score, f1_score, precision_score
 
 def log_status(msg):
     sys.stdout.write(f"[RUNNING] {msg}\n")
     sys.stdout.flush()
 
-# --- 1. SNN Architecture (Hypersensitive LIF) ---
+# --- 1. SNN Architecture (Hypersensitive) ---
 class WearableSNN(nn.Module):
     def __init__(self, num_inputs=1, num_hidden=32, num_outputs=2):
         super(WearableSNN, self).__init__()
-        
         spike_grad = surrogate.fast_sigmoid(slope=25)
         
         self.fc1 = nn.Linear(num_inputs, num_hidden)
-        # Dropped threshold to 0.2, increased beta to 0.9 to prevent leak death
-        self.lif1 = snn.Leaky(beta=0.9, threshold=0.2, spike_grad=spike_grad)
+        self.lif1 = snn.Leaky(beta=0.9, threshold=0.15, spike_grad=spike_grad)
         
         self.fc2 = nn.Linear(num_hidden, num_outputs)
-        self.lif2 = snn.Leaky(beta=0.9, threshold=0.2, spike_grad=spike_grad)
+        self.lif2 = snn.Leaky(beta=0.9, threshold=0.15, spike_grad=spike_grad)
+        
+        # Xavier Initialization 
+        nn.init.xavier_uniform_(self.fc1.weight, gain=2.0)
+        nn.init.xavier_uniform_(self.fc2.weight, gain=2.0)
 
     def forward(self, x):
         mem1 = self.lif1.init_leaky()
         mem2 = self.lif2.init_leaky()
-        
-        spk2_rec = []
-        mem2_rec = []
+        spk2_rec, mem2_rec = [], []
 
         for step in range(x.size(0)):
-            # Amplify the input current to force early activity
-            cur1 = self.fc1(x[step]) * 5.0 
+            cur1 = self.fc1(x[step]) * 2.0 
             spk1, mem1 = self.lif1(cur1, mem1)
-            
-            cur2 = self.fc2(spk1) * 5.0
+            cur2 = self.fc2(spk1) * 2.0
             spk2, mem2 = self.lif2(cur2, mem2)
-            
             spk2_rec.append(spk2)
             mem2_rec.append(mem2)
 
         return torch.stack(spk2_rec, dim=0), torch.stack(mem2_rec, dim=0)
-    
+
 # --- 2. Temporal Distillation Loss ---
 class TemporalDistillationLoss(nn.Module):
-    def __init__(self, temporal_penalty_gamma=0.01):
+    def __init__(self, weight=None):
         super(TemporalDistillationLoss, self).__init__()
-        self.ce_loss = nn.CrossEntropyLoss()
-        self.gamma = temporal_penalty_gamma
+        # Inject the physical class weights into the core PyTorch criteria
+        self.ce_loss = nn.CrossEntropyLoss(weight=weight)
+        self.gamma = 0.0 
 
     def forward(self, spike_trains, targets):
         T, B, C = spike_trains.shape
@@ -62,59 +62,149 @@ class TemporalDistillationLoss(nn.Module):
         late_spike_penalty = torch.sum(spike_trains * time_vector) / B
         
         return loss_ce + (self.gamma * late_spike_penalty), loss_ce, late_spike_penalty
+    
+import glob
 
-# --- 3. Zero-Network Learnable Dataset ---
-class SyntheticECGDataset(Dataset):
-    def __init__(self, num_samples=300, window_size=100, threshold=0.15):
-        log_status("Synthesizing learnable mathematical ECG dataset in memory...")
-        self.data, self.labels = [], []
+# --- 3. Global Biological Dataloader (Multi-Patient MIT-BIH) ---
+class MITBIHSpikeDataset(Dataset):
+    def __init__(self, data_dir='data/raw', window_size=100, threshold=0.15):
+        log_status(f"Scanning {data_dir} for multi-patient biological records...")
         
-        for _ in range(num_samples):
-            label = np.random.choice([0, 1])
-            t = np.linspace(0, 1, window_size)
-            signal = np.random.normal(0, 0.02, window_size) # Base biological noise
+        # Find all .dat files in the directory and strip the extension
+        record_paths = [f.replace('.dat', '') for f in glob.glob(f"{data_dir}/*.dat")]
+        
+        if not record_paths:
+            raise FileNotFoundError(f"CRITICAL FAULT: No .dat files found in {data_dir}.")
             
-            if label == 0:
-                # Normal Beat: Sharp, early peak
-                signal += 1.2 * np.exp(-((t - 0.3) ** 2) / (2 * 0.01 ** 2))
-            else:
-                # Arrhythmia: Inverted, delayed, wide peak
-                signal -= 0.8 * np.exp(-((t - 0.6) ** 2) / (2 * 0.04 ** 2))
+        self.signal = []
+        self.peaks = []
+        self.symbols = []
+        
+        current_offset = 0
+        
+        # Sequentially ingest every patient in the database
+        for path in record_paths:
+            try:
+                record = wfdb.rdrecord(path)
+                annotation = wfdb.rdann(path, 'atr')
                 
-            # Delta Modulate
-            spikes = np.zeros_like(signal)
-            ref = signal[0]
-            for i in range(1, len(signal)):
-                diff = signal[i] - ref
-                if diff > threshold:
-                    spikes[i] = 1; ref = signal[i]
-                elif diff < -threshold:
-                    spikes[i] = -1; ref = signal[i]
-                    
-            self.data.append(torch.tensor(spikes, dtype=torch.float32).unsqueeze(-1))
-            self.labels.append(torch.tensor(label, dtype=torch.long))
+                sig = record.p_signal[:, 0]
+                
+                # Shift the cardiologist's manual peak indices by the length of previous signals
+                shifted_peaks = annotation.sample + current_offset
+                
+                self.signal.append(sig)
+                self.peaks.append(shifted_peaks)
+                self.symbols.append(np.array(annotation.symbol))
+                
+                current_offset += len(sig)
+            except Exception as e:
+                log_status(f"WARNING: Skipping {path} due to parsing error: {e}")
+            
+        # Concatenate all patients into massive contiguous global arrays
+        self.signal = np.concatenate(self.signal)
+        self.peaks = np.concatenate(self.peaks)
+        self.symbols = np.concatenate(self.symbols)
+        
+        # Filter for valid beats across the entire population
+        valid_beats = np.isin(self.symbols, ['N', 'V', 'A', 'L', 'R'])
+        self.peaks = self.peaks[valid_beats]
+        self.symbols = self.symbols[valid_beats]
+        
+        self.window_size = window_size
+        self.threshold = threshold
+        
+        # Expose labels for the WeightedRandomSampler to balance
+        self.labels = [0 if sym == 'N' else 1 for sym in self.symbols]
+        
+        log_status(f"Global Dataset Ready: Isolated {len(self.peaks)} heartbeats across {len(record_paths)} patients.")
 
-    def __len__(self): return len(self.data)
-    def __getitem__(self, idx): return self.data[idx], self.labels[idx]
+    def _delta_modulate(self, segment):
+        spikes = np.zeros_like(segment)
+        reference = segment[0]
+        for t in range(1, len(segment)):
+            diff = segment[t] - reference
+            if diff >= self.threshold:
+                spikes[t] = 1; reference = segment[t]
+            elif diff <= -self.threshold:
+                spikes[t] = -1; reference = segment[t]
+        return spikes
 
-# --- 4. Execution Engine ---
+    def __len__(self):
+        return len(self.peaks)
+
+    def __getitem__(self, idx):
+        peak_idx = self.peaks[idx]
+        start = max(0, peak_idx - self.window_size // 2)
+        end = start + self.window_size
+        
+        segment = self.signal[start:end]
+        if len(segment) < self.window_size:
+            segment = np.pad(segment, (0, self.window_size - len(segment)), 'constant')
+            
+        spike_train = self._delta_modulate(segment)
+        label = self.labels[idx]
+        
+        return torch.tensor(spike_train, dtype=torch.float32).unsqueeze(-1), torch.tensor(label, dtype=torch.long)
+
+    def __len__(self):
+        return len(self.peaks)
+
+    def __getitem__(self, idx):
+        peak_idx = self.peaks[idx]
+        start = max(0, peak_idx - self.window_size // 2)
+        end = start + self.window_size
+        
+        segment = self.signal[start:end]
+        if len(segment) < self.window_size:
+            segment = np.pad(segment, (0, self.window_size - len(segment)), 'constant')
+            
+        spike_train = self._delta_modulate(segment)
+        label = 0 if self.symbols[idx] == 'N' else 1
+        
+        return torch.tensor(spike_train, dtype=torch.float32).unsqueeze(-1), torch.tensor(label, dtype=torch.long)
+
+# --- 4. Execution Engine (Exponential Curriculum) ---
 if __name__ == "__main__":
     device = torch.device("cpu")
-    log_status(f"Execution Engine: {device.type.upper()}")
-
+    log_status("Execution Engine: CPU")
+    
     TIME_STEPS = 100
-    EPOCHS = 10 # Increased to 10 to watch the gradual convergence
+    EPOCHS = 20 # Increased to 20 to allow the exponential curve to bite
     
     model = WearableSNN().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=2e-3)
-    # The final mathematical balance
-    criterion = TemporalDistillationLoss(temporal_penalty_gamma=0.0001)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
     
-    dataloader = DataLoader(SyntheticECGDataset(window_size=TIME_STEPS), batch_size=16, shuffle=True)
-    log_status("Initiating Temporal Distillation SNN Training on Synthesized Features...")
+    # Pass the directory, not a hardcoded single file
+    dataset = MITBIHSpikeDataset(data_dir='data/raw', window_size=TIME_STEPS)
+    
+    # --- The Oversampling Architecture ---
+    log_status("Calculating global biological class distribution...")
+    class_counts = np.bincount(dataset.labels)
+    log_status(f"Global Distribution -> Normal: {class_counts[0]}, Arrhythmia: {class_counts[1]}")
+    
+    # 1. Calculate the physical sample weights for the Sampler
+    class_weights_np = 1.0 / class_counts
+    sample_weights = [class_weights_np[label] for label in dataset.labels]
+    
+    # 2. Initialize the standard, unweighted loss function (batches are now 50/50)
+    criterion = TemporalDistillationLoss() 
+    
+    # 3. Force the dataloader to oversample the anomalies
+    sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(dataset), replacement=True)
+    dataloader = DataLoader(dataset, batch_size=32, sampler=sampler)
     
     for epoch in range(EPOCHS):
-        total_loss, total_penalty, correct, total = 0, 0, 0, 0
+        # The Exponential Scheduler
+        if epoch < 5:
+            criterion.gamma = 0.0  # Phase 1: Pure Accuracy Warmup
+        else:
+            # Phase 2: Gamma doubles every epoch
+            criterion.gamma = 1e-5 * (2.0 ** (epoch - 5)) 
+        
+        total_loss, total_penalty = 0, 0
+        all_targets = []
+        all_preds = []
         model.train()
         
         for data, targets in dataloader:
@@ -130,14 +220,20 @@ if __name__ == "__main__":
             total_loss += loss.item()
             total_penalty += late_penalty.item()
             
-            # Calculate rough accuracy
+            # Store predictions and targets for rigorous medical metrics
             _, predicted = spk_rec.sum(dim=0).max(1)
-            total += targets.size(0)
-            correct += (predicted == targets).sum().item()
+            all_targets.extend(targets.cpu().numpy())
+            all_preds.extend(predicted.cpu().numpy())
             
-        acc = 100. * correct / total
-        print(f"Epoch {epoch+1:02d}/{EPOCHS} | Loss: {total_loss:.4f} | Penalty: {total_penalty:.4f} | Accuracy: {acc:.1f}%")
-
+        # Calculate Medical Classification Metrics
+        acc = 100. * np.mean(np.array(all_preds) == np.array(all_targets))
+        recall = recall_score(all_targets, all_preds, zero_division=0) * 100.
+        precision = precision_score(all_targets, all_preds, zero_division=0) * 100.
+        f1 = f1_score(all_targets, all_preds, zero_division=0) * 100.
+        
+        print(f"Epoch {epoch+1:02d}/{EPOCHS} | Gamma: {criterion.gamma:.6f} | Loss: {total_loss:.4f} | Penalty: {total_penalty:.2f}")
+        print(f"          -> Acc: {acc:.1f}% | Recall: {recall:.1f}% | Precision: {precision:.1f}% | F1: {f1:.1f}%")
+        
     os.makedirs("models", exist_ok=True)
     save_path = 'models/distilled_snn_weights.pt'
     torch.save(model.state_dict(), save_path)
