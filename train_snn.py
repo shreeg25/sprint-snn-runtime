@@ -14,19 +14,20 @@ def log_status(msg):
     sys.stdout.write(f"[RUNNING] {msg}\n")
     sys.stdout.flush()
 
-# --- 1. SNN Architecture (Hypersensitive) ---
+# --- 1. SNN Architecture (High-Retention) ---
 class WearableSNN(nn.Module):
-    def __init__(self, num_inputs=1, num_hidden=32, num_outputs=2):
+    def __init__(self, num_inputs=1, num_hidden=128, num_outputs=2):
         super(WearableSNN, self).__init__()
         spike_grad = surrogate.fast_sigmoid(slope=25)
         
         self.fc1 = nn.Linear(num_inputs, num_hidden)
-        self.lif1 = snn.Leaky(beta=0.9, threshold=0.15, spike_grad=spike_grad)
+        # CHANGED: beta=0.99 to prevent temporal amnesia
+        self.lif1 = snn.Leaky(beta=0.99, threshold=0.15, spike_grad=spike_grad) 
         
         self.fc2 = nn.Linear(num_hidden, num_outputs)
-        self.lif2 = snn.Leaky(beta=0.9, threshold=0.15, spike_grad=spike_grad)
+        # CHANGED: beta=0.99 to prevent temporal amnesia
+        self.lif2 = snn.Leaky(beta=0.99, threshold=0.15, spike_grad=spike_grad) 
         
-        # Xavier Initialization 
         nn.init.xavier_uniform_(self.fc1.weight, gain=2.0)
         nn.init.xavier_uniform_(self.fc2.weight, gain=2.0)
 
@@ -45,12 +46,11 @@ class WearableSNN(nn.Module):
 
         return torch.stack(spk2_rec, dim=0), torch.stack(mem2_rec, dim=0)
 
-# --- 2. Temporal Distillation Loss ---
-class TemporalDistillationLoss(nn.Module):
-    def __init__(self, weight=None):
-        super(TemporalDistillationLoss, self).__init__()
-        # Inject the physical class weights into the core PyTorch criteria
-        self.ce_loss = nn.CrossEntropyLoss(weight=weight)
+# --- 2. Asymmetric Temporal Distillation Loss ---
+class AsymmetricTemporalDistillationLoss(nn.Module):
+    def __init__(self):
+        super(AsymmetricTemporalDistillationLoss, self).__init__()
+        self.ce_loss = nn.CrossEntropyLoss()
         self.gamma = 0.0 
 
     def forward(self, spike_trains, targets):
@@ -58,8 +58,21 @@ class TemporalDistillationLoss(nn.Module):
         spike_count = spike_trains.sum(dim=0) 
         loss_ce = self.ce_loss(spike_count, targets)
         
+        # Create a time vector mapping [1 to T]
         time_vector = torch.arange(1, T + 1, dtype=torch.float32, device=spike_trains.device).view(T, 1, 1) 
-        late_spike_penalty = torch.sum(spike_trains * time_vector) / B
+        
+        # Calculate the temporal penalty for EVERY sample in the batch individually
+        sample_penalties = torch.sum(spike_trains * time_vector, dim=(0, 2)) # Shape: [Batch_Size]
+        
+        # ASYMMETRIC MASKING: 
+        # Only penalize late spikes if the ground truth is Normal (Class 0).
+        # We give the network a free pass to investigate Arrhythmias (Class 1) to protect Recall.
+        normal_mask = (targets == 0).float()
+        
+        # Avoid division by zero if a batch somehow has no Normal beats
+        valid_normal_beats = normal_mask.sum() + 1e-8
+        
+        late_spike_penalty = torch.sum(sample_penalties * normal_mask) / valid_normal_beats
         
         return loss_ce + (self.gamma * late_spike_penalty), loss_ce, late_spike_penalty
     
@@ -172,11 +185,12 @@ if __name__ == "__main__":
     TIME_STEPS = 100
     EPOCHS = 20 # Increased to 20 to allow the exponential curve to bite
     
-    model = WearableSNN().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    model = WearableSNN(num_hidden=128).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=5e-4)
     
     # Pass the directory, not a hardcoded single file
-    dataset = MITBIHSpikeDataset(data_dir='data/raw', window_size=TIME_STEPS)
+    # Hypersensitize the edge-encoder to capture low-frequency pathologies
+    dataset = MITBIHSpikeDataset(data_dir='data/raw', window_size=TIME_STEPS, threshold=0.03)
     
     # --- The Oversampling Architecture ---
     log_status("Calculating global biological class distribution...")
@@ -188,7 +202,7 @@ if __name__ == "__main__":
     sample_weights = [class_weights_np[label] for label in dataset.labels]
     
     # 2. Initialize the standard, unweighted loss function (batches are now 50/50)
-    criterion = TemporalDistillationLoss() 
+    criterion = AsymmetricTemporalDistillationLoss() 
     
     # 3. Force the dataloader to oversample the anomalies
     sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(dataset), replacement=True)
@@ -199,8 +213,8 @@ if __name__ == "__main__":
         if epoch < 5:
             criterion.gamma = 0.0  # Phase 1: Pure Accuracy Warmup
         else:
-            # Phase 2: Gamma doubles every epoch
-            criterion.gamma = 1e-5 * (2.0 ** (epoch - 5)) 
+            # Phase 2: Exponential Penalty Ramp-Up
+            criterion.gamma = 1e-5 * (1.5 ** (epoch - 5)) 
         
         total_loss, total_penalty = 0, 0
         all_targets = []
@@ -220,8 +234,20 @@ if __name__ == "__main__":
             total_loss += loss.item()
             total_penalty += late_penalty.item()
             
-            # Store predictions and targets for rigorous medical metrics
-            _, predicted = spk_rec.sum(dim=0).max(1)
+# --- MEDICAL INFERENCE LOGIC (DYNAMIC THRESHOLD) ---
+            # 1. Get raw spike counts for Class 0 (Normal) and Class 1 (Arrhythmia)
+            spike_counts = spk_rec.sum(dim=0) 
+            normal_spikes = spike_counts[:, 0]
+            arrhythmia_spikes = spike_counts[:, 1]
+            
+            # 2. THE THRESHOLD PARAMETER (Alpha)
+            # If Class 1 fires more than 20% of the spikes Class 0 fires, flag it as an anomaly.
+            alpha = 0.20 
+            
+            # 3. Create boolean mask and cast to integer predictions (0 or 1)
+            predicted = (arrhythmia_spikes > (normal_spikes * alpha)).long()
+            
+            # 4. Store for rigorous medical metrics
             all_targets.extend(targets.cpu().numpy())
             all_preds.extend(predicted.cpu().numpy())
             
