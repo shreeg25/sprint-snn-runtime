@@ -235,15 +235,8 @@ if __name__ == "__main__":
             total_penalty += late_penalty.item()
             
 # --- MEDICAL INFERENCE LOGIC (DYNAMIC THRESHOLD) ---
-            # 1. Get raw spike counts for Class 0 (Normal) and Class 1 (Arrhythmia)
-            spike_counts = spk_rec.sum(dim=0) 
-            normal_spikes = spike_counts[:, 0]
-            arrhythmia_spikes = spike_counts[:, 1]
-            
-            # 2. THE THRESHOLD PARAMETER (Alpha)
-            # THE THRESHOLD PARAMETER (Alpha)
-            alpha = 0.80 
-            predicted = (arrhythmia_spikes > (normal_spikes * alpha)).long()
+            # --- STANDARD INFERENCE LOGIC ---
+            _, predicted = spk_rec.sum(dim=0).max(1)
             
             # 4. Store for rigorous medical metrics
             all_targets.extend(targets.cpu().numpy())
