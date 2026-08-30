@@ -1,0 +1,47 @@
+(venv) shree@LAPTOP-8VBG58R2:/mnt/e/sprint-snn-runtime$ python train_snn.py 
+[RUNNING] Execution Engine: CPU
+[RUNNING] Scanning data/raw for multi-patient biological records...
+[RUNNING] Global Dataset Ready: Isolated 100062 heartbeats across 48 patients.
+[RUNNING] Calculating global biological class distribution...
+[RUNNING] Global Distribution -> Normal: 75052, Arrhythmia: 25010
+Epoch 01/20 | Gamma: 0.000000 | Loss: 1915.1439 | Penalty: 14746.46
+          -> Acc: 65.9% | Recall: 34.3% | Precision: 92.9% | F1: 50.2%
+Epoch 02/20 | Gamma: 0.000000 | Loss: 1800.7349 | Penalty: 13126.22
+          -> Acc: 71.2% | Recall: 44.3% | Precision: 95.2% | F1: 60.5%
+Epoch 03/20 | Gamma: 0.000000 | Loss: 1800.2833 | Penalty: 14264.63
+          -> Acc: 71.7% | Recall: 45.5% | Precision: 95.2% | F1: 61.6%
+Epoch 04/20 | Gamma: 0.000000 | Loss: 1781.9434 | Penalty: 13138.06
+          -> Acc: 71.9% | Recall: 46.0% | Precision: 95.8% | F1: 62.2%
+Epoch 05/20 | Gamma: 0.000000 | Loss: 1756.8597 | Penalty: 14859.10
+          -> Acc: 72.8% | Recall: 47.7% | Precision: 95.7% | F1: 63.7%
+Epoch 06/20 | Gamma: 0.000010 | Loss: 1739.4622 | Penalty: 12563.64
+          -> Acc: 73.4% | Recall: 49.0% | Precision: 96.1% | F1: 64.9%
+Epoch 07/20 | Gamma: 0.000015 | Loss: 1740.0370 | Penalty: 12612.78
+          -> Acc: 73.9% | Recall: 49.6% | Precision: 96.0% | F1: 65.4%
+Epoch 08/20 | Gamma: 0.000023 | Loss: 1728.0327 | Penalty: 13382.80
+          -> Acc: 74.5% | Recall: 50.7% | Precision: 95.9% | F1: 66.3%
+Epoch 09/20 | Gamma: 0.000034 | Loss: 1773.4907 | Penalty: 19531.91
+          -> Acc: 74.1% | Recall: 50.4% | Precision: 96.0% | F1: 66.1%
+Epoch 10/20 | Gamma: 0.000051 | Loss: 1734.6174 | Penalty: 12356.20
+          -> Acc: 74.1% | Recall: 50.2% | Precision: 95.9% | F1: 65.9%
+Epoch 11/20 | Gamma: 0.000076 | Loss: 1730.5647 | Penalty: 13339.77
+          -> Acc: 74.4% | Recall: 50.6% | Precision: 96.1% | F1: 66.2%
+Epoch 12/20 | Gamma: 0.000114 | Loss: 1733.6495 | Penalty: 12527.32
+          -> Acc: 73.4% | Recall: 49.3% | Precision: 96.0% | F1: 65.1%
+Epoch 13/20 | Gamma: 0.000171 | Loss: 1734.6799 | Penalty: 12659.65
+          -> Acc: 73.4% | Recall: 49.1% | Precision: 96.2% | F1: 65.0%
+Epoch 14/20 | Gamma: 0.000256 | Loss: 1721.5800 | Penalty: 11664.95
+          -> Acc: 74.1% | Recall: 50.1% | Precision: 96.3% | F1: 65.9%
+Epoch 15/20 | Gamma: 0.000384 | Loss: 1754.4225 | Penalty: 15196.22
+          -> Acc: 73.8% | Recall: 49.6% | Precision: 96.1% | F1: 65.4%
+Epoch 16/20 | Gamma: 0.000577 | Loss: 1735.7463 | Penalty: 10943.99
+          -> Acc: 73.8% | Recall: 49.4% | Precision: 96.5% | F1: 65.3%
+Epoch 17/20 | Gamma: 0.000865 | Loss: 1740.7887 | Penalty: 12017.55
+          -> Acc: 73.7% | Recall: 49.5% | Precision: 96.2% | F1: 65.4%
+Epoch 18/20 | Gamma: 0.001297 | Loss: 1740.3202 | Penalty: 11979.19
+          -> Acc: 73.9% | Recall: 49.8% | Precision: 96.4% | F1: 65.7%
+Epoch 19/20 | Gamma: 0.001946 | Loss: 1754.1649 | Penalty: 9178.61
+          -> Acc: 73.1% | Recall: 47.8% | Precision: 96.7% | F1: 64.0%
+Epoch 20/20 | Gamma: 0.002919 | Loss: 1760.2727 | Penalty: 9197.99
+          -> Acc: 73.2% | Recall: 48.0% | Precision: 96.6% | F1: 64.1%
+[RUNNING] SUCCESS: Hardware SNN weights extracted to models/distilled_snn_weights.pt
