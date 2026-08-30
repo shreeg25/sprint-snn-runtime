@@ -22,11 +22,11 @@ class WearableSNN(nn.Module):
         
         self.fc1 = nn.Linear(num_inputs, num_hidden)
         # CHANGED: beta=0.99 to prevent temporal amnesia
-        self.lif1 = snn.Leaky(beta=0.99, threshold=0.15, spike_grad=spike_grad) 
+        self.lif1 = snn.Leaky(beta=0.9, threshold=0.15, spike_grad=spike_grad) 
         
         self.fc2 = nn.Linear(num_hidden, num_outputs)
         # CHANGED: beta=0.99 to prevent temporal amnesia
-        self.lif2 = snn.Leaky(beta=0.99, threshold=0.15, spike_grad=spike_grad) 
+        self.lif2 = snn.Leaky(beta=0.9, threshold=0.15, spike_grad=spike_grad) 
         
         nn.init.xavier_uniform_(self.fc1.weight, gain=2.0)
         nn.init.xavier_uniform_(self.fc2.weight, gain=2.0)
@@ -190,7 +190,7 @@ if __name__ == "__main__":
     
     # Pass the directory, not a hardcoded single file
     # Hypersensitize the edge-encoder to capture low-frequency pathologies
-    dataset = MITBIHSpikeDataset(data_dir='data/raw', window_size=TIME_STEPS, threshold=0.03)
+    dataset = MITBIHSpikeDataset(data_dir='data/raw', window_size=TIME_STEPS, threshold=0.15)
     
     # --- The Oversampling Architecture ---
     log_status("Calculating global biological class distribution...")
@@ -241,10 +241,8 @@ if __name__ == "__main__":
             arrhythmia_spikes = spike_counts[:, 1]
             
             # 2. THE THRESHOLD PARAMETER (Alpha)
-            # If Class 1 fires more than 20% of the spikes Class 0 fires, flag it as an anomaly.
-            alpha = 0.20 
-            
-            # 3. Create boolean mask and cast to integer predictions (0 or 1)
+            # THE THRESHOLD PARAMETER (Alpha)
+            alpha = 0.80 
             predicted = (arrhythmia_spikes > (normal_spikes * alpha)).long()
             
             # 4. Store for rigorous medical metrics
