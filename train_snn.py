@@ -14,19 +14,17 @@ def log_status(msg):
     sys.stdout.write(f"[RUNNING] {msg}\n")
     sys.stdout.flush()
 
-# --- 1. SNN Architecture (High-Retention) ---
+# --- 1. SNN Architecture (Decoupled Integrator) ---
 class WearableSNN(nn.Module):
-    def __init__(self, num_inputs=1, num_hidden=128, num_outputs=2):
+    def __init__(self, num_inputs=1, num_hidden=256, num_outputs=2):
         super(WearableSNN, self).__init__()
         spike_grad = surrogate.fast_sigmoid(slope=25)
         
         self.fc1 = nn.Linear(num_inputs, num_hidden)
-        # CHANGED: beta=0.99 to prevent temporal amnesia
-        self.lif1 = snn.Leaky(beta=0.9, threshold=0.15, spike_grad=spike_grad) 
+        self.lif1 = snn.Leaky(beta=0.95, threshold=0.15, spike_grad=spike_grad) 
         
         self.fc2 = nn.Linear(num_hidden, num_outputs)
-        # CHANGED: beta=0.99 to prevent temporal amnesia
-        self.lif2 = snn.Leaky(beta=0.9, threshold=0.15, spike_grad=spike_grad) 
+        self.lif2 = snn.Leaky(beta=0.95, threshold=0.15, spike_grad=spike_grad) 
         
         nn.init.xavier_uniform_(self.fc1.weight, gain=2.0)
         nn.init.xavier_uniform_(self.fc2.weight, gain=2.0)
@@ -41,37 +39,35 @@ class WearableSNN(nn.Module):
             spk1, mem1 = self.lif1(cur1, mem1)
             cur2 = self.fc2(spk1) * 2.0
             spk2, mem2 = self.lif2(cur2, mem2)
+            
             spk2_rec.append(spk2)
             mem2_rec.append(mem2)
 
+        # Explicitly return BOTH spikes and membrane voltages
         return torch.stack(spk2_rec, dim=0), torch.stack(mem2_rec, dim=0)
 
-# --- 2. Asymmetric Temporal Distillation Loss ---
+# --- 2. Decoupled Asymmetric Temporal Loss ---
 class AsymmetricTemporalDistillationLoss(nn.Module):
-    def __init__(self):
+    def __init__(self, device):
         super(AsymmetricTemporalDistillationLoss, self).__init__()
-        self.ce_loss = nn.CrossEntropyLoss()
+        # Brutal gradient penalty for missing Class 1
+        weight_tensor = torch.tensor([1.0, 3.0]).to(device)
+        self.ce_loss = nn.CrossEntropyLoss(weight=weight_tensor)
         self.gamma = 0.0 
 
-    def forward(self, spike_trains, targets):
+    def forward(self, spike_trains, mem_trains, targets):
         T, B, C = spike_trains.shape
-        spike_count = spike_trains.sum(dim=0) 
-        loss_ce = self.ce_loss(spike_count, targets)
         
-        # Create a time vector mapping [1 to T]
+        # 1. CLASSIFICATION: Use accumulated membrane voltage for rich gradients
+        mem_logits = mem_trains.sum(dim=0) 
+        loss_ce = self.ce_loss(mem_logits, targets)
+        
+        # 2. PRUNING: Punish the physical late spikes
         time_vector = torch.arange(1, T + 1, dtype=torch.float32, device=spike_trains.device).view(T, 1, 1) 
+        sample_penalties = torch.sum(spike_trains * time_vector, dim=(0, 2)) 
         
-        # Calculate the temporal penalty for EVERY sample in the batch individually
-        sample_penalties = torch.sum(spike_trains * time_vector, dim=(0, 2)) # Shape: [Batch_Size]
-        
-        # ASYMMETRIC MASKING: 
-        # Only penalize late spikes if the ground truth is Normal (Class 0).
-        # We give the network a free pass to investigate Arrhythmias (Class 1) to protect Recall.
         normal_mask = (targets == 0).float()
-        
-        # Avoid division by zero if a batch somehow has no Normal beats
         valid_normal_beats = normal_mask.sum() + 1e-8
-        
         late_spike_penalty = torch.sum(sample_penalties * normal_mask) / valid_normal_beats
         
         return loss_ce + (self.gamma * late_spike_penalty), loss_ce, late_spike_penalty
@@ -160,23 +156,6 @@ class MITBIHSpikeDataset(Dataset):
         
         return torch.tensor(spike_train, dtype=torch.float32).unsqueeze(-1), torch.tensor(label, dtype=torch.long)
 
-    def __len__(self):
-        return len(self.peaks)
-
-    def __getitem__(self, idx):
-        peak_idx = self.peaks[idx]
-        start = max(0, peak_idx - self.window_size // 2)
-        end = start + self.window_size
-        
-        segment = self.signal[start:end]
-        if len(segment) < self.window_size:
-            segment = np.pad(segment, (0, self.window_size - len(segment)), 'constant')
-            
-        spike_train = self._delta_modulate(segment)
-        label = 0 if self.symbols[idx] == 'N' else 1
-        
-        return torch.tensor(spike_train, dtype=torch.float32).unsqueeze(-1), torch.tensor(label, dtype=torch.long)
-
 # --- 4. Execution Engine (Exponential Curriculum) ---
 if __name__ == "__main__":
     device = torch.device("cpu")
@@ -185,8 +164,8 @@ if __name__ == "__main__":
     TIME_STEPS = 100
     EPOCHS = 20 # Increased to 20 to allow the exponential curve to bite
     
-    model = WearableSNN(num_hidden=128).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=5e-4)
+    model = WearableSNN(num_hidden=256).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
     
     # Pass the directory, not a hardcoded single file
     # Hypersensitize the edge-encoder to capture low-frequency pathologies
@@ -202,7 +181,7 @@ if __name__ == "__main__":
     sample_weights = [class_weights_np[label] for label in dataset.labels]
     
     # 2. Initialize the standard, unweighted loss function (batches are now 50/50)
-    criterion = AsymmetricTemporalDistillationLoss() 
+    criterion = AsymmetricTemporalDistillationLoss(device=device)
     
     # 3. Force the dataloader to oversample the anomalies
     sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(dataset), replacement=True)
@@ -223,9 +202,12 @@ if __name__ == "__main__":
         
         for data, targets in dataloader:
             data, targets = data.transpose(0, 1).to(device), targets.to(device)
-            spk_rec, _ = model(data)
             
-            loss, ce, late_penalty = criterion(spk_rec, targets)
+            # Unpack both tensors
+            spk_rec, mem_rec = model(data)
+            
+            # Pass both to the decoupled loss
+            loss, ce, late_penalty = criterion(spk_rec, mem_rec, targets)
             
             optimizer.zero_grad()
             loss.backward()
@@ -234,11 +216,10 @@ if __name__ == "__main__":
             total_loss += loss.item()
             total_penalty += late_penalty.item()
             
-# --- MEDICAL INFERENCE LOGIC (DYNAMIC THRESHOLD) ---
-            # --- STANDARD INFERENCE LOGIC ---
-            _, predicted = spk_rec.sum(dim=0).max(1)
+            # --- MEDICAL INFERENCE LOGIC ---
+            # Evaluate using the exact same membrane logits the network is training on
+            _, predicted = mem_rec.sum(dim=0).max(1)
             
-            # 4. Store for rigorous medical metrics
             all_targets.extend(targets.cpu().numpy())
             all_preds.extend(predicted.cpu().numpy())
             
