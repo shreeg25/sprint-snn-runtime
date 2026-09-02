@@ -1,0 +1,12 @@
+ELASTIC RUNTIME EVOLUTION
+=========================
+T=010 | Recall:  1.20% | Precision: 47.13%
+T=020 | Recall:  3.50% | Precision: 55.19%
+T=030 | Recall:  5.53% | Precision: 71.68%
+T=040 | Recall: 15.44% | Precision: 88.70%
+T=050 | Recall: 38.55% | Precision: 83.91%
+T=060 | Recall: 51.74% | Precision: 74.95%
+T=070 | Recall: 70.92% | Precision: 71.10%
+T=080 | Recall: 74.58% | Precision: 73.81%
+T=090 | Recall: 78.32% | Precision: 81.61%
+T=100 | Recall: 77.93% | Precision: 88.47%
