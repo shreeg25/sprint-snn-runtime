@@ -1,0 +1,32 @@
+SYNCHRONIZED 20-EPOCH ARCHITECTURAL BENCHMARK
+=============================================
+Model: Proposed SNN (Edge)
+  -> Accuracy:  83.85%
+  -> Recall:    77.74%
+  -> Precision: 88.62%
+  -> F1-Score:  82.82%
+---------------------------------------------
+Model: Float32 MLP (20 Ep)
+  -> Accuracy:  98.58%
+  -> Recall:    98.01%
+  -> Precision: 99.11%
+  -> F1-Score:  98.56%
+---------------------------------------------
+Model: Float32 CNN (20 Ep)
+  -> Accuracy:  95.19%
+  -> Recall:    95.01%
+  -> Precision: 95.38%
+  -> F1-Score:  95.20%
+---------------------------------------------
+Model: INT8 CNN (Edge)
+  -> Accuracy:  95.29%
+  -> Recall:    94.53%
+  -> Precision: 95.98%
+  -> F1-Score:  95.25%
+---------------------------------------------
+Model: Random Forest (Edge)
+  -> Accuracy:  90.27%
+  -> Recall:    84.79%
+  -> Precision: 95.13%
+  -> F1-Score:  89.66%
+---------------------------------------------
