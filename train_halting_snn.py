@@ -139,6 +139,71 @@ more, so this is deliberately NOT checkpoint-based intermittency):
    underlying continuous halt_prob_t exactly as before (point 4/5
    protections on halt_head init and T_min are untouched by this).
 
+10. CAUGHT AND FIXED (do not reintroduce): the voltage-gated threshold in
+    point 9 initially had NO curriculum gating and the model's forward
+    loop had NO t_min floor of its own -- t_min was only ever applied to
+    halt_probs inside the LOSS's soft p_stop expectation, never to the
+    hard STE spike that actually drives v_mem's hard reset
+    (`v_mem *= (1 - halt_spike_t)`). Since lambda(V_dd) can decay toward
+    0 as V_dd crosses V_critical, it can fall below the tiny ambient
+    halt_prob_t floor (~sigmoid(-6.0)~0.0025) from bias_init alone,
+    triggering a real hard v_mem reset driven purely by voltage decay,
+    before the halt head has learned anything -- wiping out accumulated
+    evidence for a big chunk of the batch from epoch 1, which then blows
+    up the classification loss/gradients on garbage state and corrupts
+    the weights to NaN within 1-2 epochs (observed: T_halt collapsing to
+    ~16 steps in epoch 1 under gamma=0 warm-up, all-negative NaN collapse
+    by epoch 2). Fixed two ways: (a) t_min is now ALSO hard-enforced in
+    the model's forward loop itself (halt_spike_t forced to 0 for
+    t < t_min, no STE pass-through, mirroring what the docstring already
+    claimed -- "for the whole run" -- but which was previously only true
+    of the loss's soft expectation); (b) the threshold's voltage-
+    sensitivity is now curriculum-gated by the SAME gamma_0/gamma_max
+    progress that already gates gamma_eff, via a `voltage_gate` in [0,1]
+    threaded into both the model and the loss: at voltage_gate=0 (full
+    warm-up) lambda_t collapses to the flat lambda_base (recovering the
+    original safe fixed-threshold policy), and only as curriculum
+    progresses does lambda_t ramp into full V_dd-sensitivity. This keeps
+    the elastic/voltage-eager behavior for the fully-trained/deployed
+    model (voltage_gate=1.0 in tune_threshold and the final power/
+    latency report) while preventing an untrained halt head from being
+    voltage-forced into premature resets during exactly the epochs where
+    the "Patience Penalty Deadlock" protections (points 4/5) matter most.
+
+11. bf16 (NOT fp16) is the only supported autocast dtype for cfg.use_amp
+    (see HaltConfig). fp16's ~5-bit exponent has real risk of overflow/
+    underflow in the loss's cumprod-based S_t = cumprod(1 - halt_probs)
+    computed over T_max=100 steps of values close to 1 -- exactly the
+    kind of silent precision loss that would be hard to distinguish from
+    a real NaN-collapse bug (see point 10) rather than an autocast
+    artifact. bf16 keeps fp32's ~8-bit exponent range, avoiding that
+    class of failure, at some precision cost that has not caused issues
+    in testing. use_amp defaults to False regardless -- opt in and watch
+    loss_total/mean_gamma_eff/mean_lambda_threshold for NaN after
+    enabling it, same as any other precision change to this file.
+
+12. CAUGHT AND FIXED (do not reintroduce): halt_logit_t (raw output of
+    halt_head, pre-sigmoid) was unclamped. Nothing bounds halt_head's
+    weights, so once gamma_0 > 0 gives the halt head its first real
+    incentive to be decisive (as opposed to warm-up's gamma=0, no
+    latency pressure at all), gradient descent can push a logit large
+    enough that sigmoid saturates to EXACTLY 1.0 in float32 -- making
+    (1 - halt_prob_t) exactly 0.0. torch.cumprod's backward pass (used
+    on 1-halt_probs for S_t in the loss's survival computation, point
+    "S_t = cumprod(...)" above) is a known case that produces NaN
+    gradients when any element of the product is exactly zero. Observed
+    symptom: stable, improving F1 through all of warm-up, immediate
+    collapse (Avg T_Halt -> nan, all-negative predictions) within 1-2
+    epochs of CURRICULUM starting -- i.e. within 1-2 epochs of gamma_0
+    first going nonzero, not tied to epoch count in general. Fixed by
+    clamping halt_logit_t to [-15, 15] BEFORE sigmoid, in the model
+    (single point of truth -- every downstream cumprod, in the loss and
+    in tune_threshold's duplicate S_t logic, consumes halt_probs that
+    already came from this clamped logit, so no second clamp is needed
+    at each cumprod call site). sigmoid(+-15) ~= 1 -+ 3e-7, nowhere near
+    float32's exact-1.0 saturation point, at negligible cost to the
+    halt head's effective confidence range.
+
 Expected outputs (unchanged from spec):
   spike_trains: (T_max, B, 3) -- channel 2 is the hard STE halt spike.
   mem_trains:   (T_max, B, 3) -- channels 0 & 1 are V_class(t).
@@ -237,6 +302,20 @@ class HaltConfig:
 
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # -- GPU utilization (see main()'s device banner and DataLoader setup) --
+    # num_workers/pin_memory only help when device=="cuda" (pinned host
+    # memory + async H2D copy has no benefit on CPU-only runs); main()
+    # forces both to CPU-safe values automatically when cfg.device=="cpu",
+    # so these defaults are safe regardless of the machine actually used.
+    num_workers: int = 4
+    pin_memory: bool = True
+    # bf16 autocast (NOT fp16 -- see module docstring point 11) for the
+    # encoder/recurrent/head matmuls only. Off by default: this codebase
+    # just had a real NaN-collapse bug (point 10), so precision changes
+    # are opt-in and should be re-validated (watch mean_gamma_eff /
+    # mean_lambda_threshold / loss_total for NaN) before trusting a run.
+    use_amp: bool = False
 
 
 # --------------------------------------------------------------------------
@@ -456,6 +535,7 @@ def extract_energy_channels(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor
 
 def load_mit_bih_data(
     data_dir: str, t_max: int = 100, batch_size: int = 64, seed: int = 42,
+    num_workers: int = 0, pin_memory: bool = False,
 ) -> Tuple[DataLoader, DataLoader, DataLoader, np.ndarray, Dataset]:
     train_ids, val_ids, test_ids = stratified_patient_split(data_dir, seed=seed)
 
@@ -471,9 +551,18 @@ def load_mit_bih_data(
     val_ds = MITBIHVoltageDataset(val_base, seed=seed + 1)
     test_ds = MITBIHVoltageDataset(test_base, seed=seed + 2)
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+    # pin_memory + persistent_workers only help on a CUDA run (pinned
+    # host buffers speed up the async H2D copy paired with non_blocking
+    # transfers below; persistent_workers avoids respawning worker
+    # processes every epoch). num_workers=0 disables multiprocessing
+    # entirely, which is what main() passes on CPU-only runs.
+    persistent = num_workers > 0
+    loader_kwargs = dict(num_workers=num_workers, pin_memory=pin_memory,
+                          persistent_workers=persistent)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                               drop_last=True, **loader_kwargs)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, **loader_kwargs)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, **loader_kwargs)
 
     # test_base (unwrapped, no V_dd channel yet) is returned alongside the
     # loaders so evaluate_power_latency_tradeoff() can re-wrap it with
@@ -567,20 +656,23 @@ class LIFHaltingSNN(nn.Module):
 
     def __init__(self, in_features: int, hidden: int, t_max: int, beta: float = 0.9,
                  v_max: float = 50.0, lambda_base: float = 0.5, lambda_k: float = 10.0,
-                 v_critical: float = 0.3):
+                 v_critical: float = 0.3, t_min: int = 10):
         super().__init__()
         self.t_max = t_max
         self.hidden = hidden
         self.beta = beta
         self.v_max = v_max
 
-        # Voltage-gated halt threshold, see module docstring point 9.
+        # Voltage-gated halt threshold, see module docstring points 9-10.
         # Fixed hyperparameters (not learned), matching that lambda_base
         # is meant to be swept across RUNS via config/CLI, and lambda_k
         # is meant to stay fixed -- neither is nn.Parameter.
         self.lambda_base = lambda_base
         self.lambda_k = lambda_k
         self.v_critical = v_critical
+        # t_min is ALSO enforced here (not just in the loss's soft
+        # p_stop expectation) -- see module docstring point 10.
+        self.t_min = t_min
 
         self.encoder = nn.Linear(in_features, hidden)
         self.recurrent_weights = nn.Linear(hidden, hidden, bias=False)
@@ -591,10 +683,17 @@ class LIFHaltingSNN(nn.Module):
         _init_halt_head_conservative(self)
 
     def forward(
-        self, x: torch.Tensor, early_exit: bool = False
+        self, x: torch.Tensor, early_exit: bool = False, voltage_gate: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        x: (B, T_max, F) where F = F_ecg + 1 (ECG channel(s) + V_dd).
+        x: (B, T_max, F) where F = F_ecg + 2 (ECG channel(s) + V_dd + dV_dd).
+        voltage_gate: in [0, 1], curriculum progress -- see module
+        docstring point 10. 0.0 = threshold collapses to flat lambda_base
+        (safe, original fixed-threshold policy); 1.0 = full V_dd-
+        sensitive threshold. Callers pass voltage_gate_for_gamma(gamma_0,
+        cfg) during training/val (ramping with the same curriculum that
+        already gates gamma_eff) and 1.0 for final/deployed evaluation
+        (tune_threshold, evaluate_power_latency_tradeoff).
         Returns (spike_trains, mem_trains, halt_probs) per the contract:
           spike_trains: (T_max, B, 3), channel 2 = hard STE halt spike
           mem_trains:   (T_max, B, 3), channels 0/1 = V_class(t)
@@ -620,19 +719,52 @@ class LIFHaltingSNN(nn.Module):
             v_mem = torch.clamp(v_mem, min=-self.v_max, max=self.v_max)  # defense-in-depth
 
             halt_logit_t = self.halt_head(v_mem).squeeze(-1)
+            # Defense-in-depth clamp (see module docstring point 12): with
+            # no bound on halt_head's weights, gradient descent can in
+            # principle push halt_logit_t large enough that sigmoid
+            # saturates to EXACTLY 1.0 in float32. That makes
+            # (1 - halt_prob_t) exactly 0.0, and torch.cumprod's backward
+            # pass (used on 1-halt_probs in the loss's S_t survival
+            # computation) is known to produce NaN gradients when any
+            # element of the product is exactly zero. Clamping here keeps
+            # halt_prob_t in [sigmoid(-15), sigmoid(15)] ~= [3e-7,
+            # 1-3e-7], safely away from that boundary, for every
+            # downstream cumprod (loss AND tune_threshold's duplicate
+            # S_t logic) without needing a second clamp at each site.
+            halt_logit_t = torch.clamp(halt_logit_t, min=-15.0, max=15.0)
             halt_prob_t = torch.sigmoid(halt_logit_t)
 
-            # Voltage-gated threshold in place of the literal constant
-            # 0.5 -- see module docstring point 9. This only changes the
-            # HARD spike decision; the STE below still routes gradient
-            # through the continuous halt_prob_t exactly as before, so
-            # this threshold need not (and does not) need to be
-            # differentiable itself.
-            lambda_t = self.lambda_base * torch.sigmoid(
-                self.lambda_k * (v_dd_seq[:, t] - self.v_critical)
-            )  # (B,)
-            halt_spike_t = (halt_prob_t > lambda_t).float()
-            halt_spike_t = halt_spike_t + (halt_prob_t - halt_prob_t.detach())  # STE
+            if t < self.t_min:
+                # Structural floor: for t < t_min the hard spike is
+                # forced to exactly 0, with NO STE pass-through -- see
+                # module docstring point 10. This mirrors, in the
+                # forward pass itself, what the loss's soft p_stop
+                # expectation already does (masking halt_probs before
+                # t_min); previously t_min was enforced ONLY in the
+                # loss, so it never protected this hard v_mem reset. A
+                # continuous halt_prob_t is still computed and recorded
+                # above (loss-side t_min masking still applies to it
+                # independently) -- only the physical reset is floored.
+                halt_spike_t = torch.zeros(B, device=device, dtype=dtype)
+            else:
+                # Voltage-gated threshold in place of the literal constant
+                # 0.5 -- see module docstring points 9-10. voltage_gate
+                # blends between the flat, safe lambda_base (gate=0) and
+                # the full V_dd-sensitive gate (gate=1), so an untrained
+                # halt head early in curriculum can't be voltage-forced
+                # into a hard reset -- see point 10 for why this matters.
+                # This only changes the HARD spike decision; the STE
+                # below still routes gradient through the continuous
+                # halt_prob_t exactly as before, so this threshold need
+                # not (and does not) need to be differentiable itself.
+                lambda_t = self.lambda_base * (
+                    (1.0 - voltage_gate)
+                    + voltage_gate * torch.sigmoid(
+                        self.lambda_k * (v_dd_seq[:, t] - self.v_critical)
+                    )
+                )  # (B,)
+                halt_spike_t = (halt_prob_t > lambda_t).float()
+                halt_spike_t = halt_spike_t + (halt_prob_t - halt_prob_t.detach())  # STE
 
             class_mem_t = self.class_head(v_mem)  # reads accumulated evidence, not instantaneous input
 
@@ -654,7 +786,22 @@ def build_model(in_features: int, cfg: HaltConfig) -> nn.Module:
         in_features=in_features, hidden=cfg.hidden, t_max=cfg.t_max,
         beta=cfg.beta, v_max=cfg.v_max,
         lambda_base=cfg.lambda_base, lambda_k=cfg.lambda_k, v_critical=cfg.v_critical,
+        t_min=cfg.t_min,
     )
+
+
+def voltage_gate_for_gamma(gamma_0: float, cfg: HaltConfig) -> float:
+    """
+    Curriculum progress in [0, 1] for the voltage-gated threshold -- see
+    module docstring point 10. Reuses the SAME gamma_0/gamma_max ramp
+    that already gates gamma_eff, as a single source of truth: gate=0.0
+    for the whole gamma=0 warm-up phase (flat lambda_base threshold,
+    the original safe fixed-threshold policy), ramping to gate=1.0 once
+    gamma_0 reaches gamma_max (full V_dd-sensitive threshold).
+    """
+    if cfg.gamma_max <= 0:
+        return 1.0
+    return min(1.0, max(0.0, gamma_0 / cfg.gamma_max))
 
 
 # --------------------------------------------------------------------------
@@ -774,6 +921,7 @@ class ElasticHaltingLoss(nn.Module):
         gamma_0: float,
         v_dd: torch.Tensor,         # (B, T)
         delta_v_dd: torch.Tensor,   # (B, T)
+        voltage_gate: float = 1.0,  # see module docstring point 10 / voltage_gate_for_gamma
     ) -> Tuple[torch.Tensor, dict]:
         class_mem = mem_trains[:, :, :2]  # (T, B, 2)
         T = halt_probs.shape[0]
@@ -825,9 +973,10 @@ class ElasticHaltingLoss(nn.Module):
         # module docstring points 8-9 and evaluate_power_latency_tradeoff.
         v_dd_tm = v_dd.transpose(0, 1)  # (T, B)
         v_dd_at_halt = (p_stop_full * v_dd_tm).sum(dim=0)  # (B,), E[V_dd at halting time]
-        lambda_trace = self.cfg.lambda_base * torch.sigmoid(
-            self.cfg.lambda_k * (v_dd_tm - self.cfg.v_critical)
-        )  # (T, B), mirrors the model's internal threshold for logging only
+        lambda_trace = self.cfg.lambda_base * (
+            (1.0 - voltage_gate)
+            + voltage_gate * torch.sigmoid(self.cfg.lambda_k * (v_dd_tm - self.cfg.v_critical))
+        )  # (T, B), mirrors the model's internal (gated) threshold for logging only
 
         stats = {
             "loss_total": total_loss.detach(),
@@ -884,8 +1033,8 @@ def tune_threshold(model: nn.Module, loader: DataLoader, cfg: HaltConfig,
     all_logits, all_targets = [], []
     with torch.no_grad():
         for x, y in loader:
-            x = x.to(cfg.device)
-            _, mem_trains, halt_probs = model(x, early_exit=True)
+            x = x.to(cfg.device, non_blocking=True)
+            _, mem_trains, halt_probs = model(x, early_exit=True, voltage_gate=1.0)
             class_mem = mem_trains[:, :, :2]
 
             p_halt = halt_probs
@@ -931,13 +1080,21 @@ def train_one_epoch(model, loader, loss_fn, optimizer, gamma, cfg) -> dict:
     n_batches = 0
 
     for x, y in loader:
-        x = x.to(cfg.device)
-        y = y.to(cfg.device)
+        x = x.to(cfg.device, non_blocking=True)
+        y = y.to(cfg.device, non_blocking=True)
         v_dd, delta_v_dd = extract_energy_channels(x)  # (B, T) each
+        voltage_gate = voltage_gate_for_gamma(gamma, cfg)
 
         optimizer.zero_grad(set_to_none=True)
-        _, mem_trains, halt_probs = model(x, early_exit=False)  # full sequence during training
-        loss, stats = loss_fn(mem_trains, halt_probs, y, gamma, v_dd, delta_v_dd)
+        # bf16 autocast only (see module docstring point 11) -- off by
+        # default via cfg.use_amp, gradient math (backward/clip/step)
+        # stays outside the autocast context, at full precision.
+        with torch.autocast(device_type=cfg.device, dtype=torch.bfloat16,
+                             enabled=(cfg.use_amp and cfg.device == "cuda")):
+            _, mem_trains, halt_probs = model(
+                x, early_exit=False, voltage_gate=voltage_gate,
+            )  # full sequence during training
+            loss, stats = loss_fn(mem_trains, halt_probs, y, gamma, v_dd, delta_v_dd, voltage_gate)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.max_grad_norm)
         optimizer.step()
@@ -960,12 +1117,17 @@ def evaluate(model, loader, loss_fn, gamma, cfg, threshold: float) -> dict:
                      "mean_v_dd_at_halt": 0.0, "mean_lambda_threshold": 0.0}
 
     for x, y in loader:
-        x = x.to(cfg.device)
-        y = y.to(cfg.device)
+        x = x.to(cfg.device, non_blocking=True)
+        y = y.to(cfg.device, non_blocking=True)
         v_dd, delta_v_dd = extract_energy_channels(x)  # (B, T) each
+        voltage_gate = voltage_gate_for_gamma(gamma, cfg)
 
-        _, mem_trains, halt_probs = model(x, early_exit=True)  # real early exit at inference
-        loss, stats = loss_fn(mem_trains, halt_probs, y, gamma, v_dd, delta_v_dd)
+        with torch.autocast(device_type=cfg.device, dtype=torch.bfloat16,
+                             enabled=(cfg.use_amp and cfg.device == "cuda")):
+            _, mem_trains, halt_probs = model(
+                x, early_exit=True, voltage_gate=voltage_gate,
+            )  # real early exit at inference
+            loss, stats = loss_fn(mem_trains, halt_probs, y, gamma, v_dd, delta_v_dd, voltage_gate)
 
         all_logits.append(stats["halted_logits"].cpu())
         all_targets.append(y.cpu())
@@ -1004,7 +1166,9 @@ def evaluate_power_latency_tradeoff(
     for alpha in cfg.eval_alpha_grid:
         ds = MITBIHVoltageDataset(test_base, fixed_alpha=alpha, noise_std=0.01,
                                    seed=cfg.seed + 100)
-        loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=False)
+        loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=False,
+                             num_workers=cfg.num_workers if cfg.device == "cuda" else 0,
+                             pin_memory=cfg.pin_memory and cfg.device == "cuda")
         metrics = evaluate(model, loader, loss_fn, gamma=cfg.gamma_max, cfg=cfg,
                             threshold=threshold)
         row = {"alpha": alpha, **metrics}
@@ -1057,6 +1221,17 @@ def main():
                          help="Weight on (V_nominal - V_dd) in gamma_eff.")
     parser.add_argument("--v_critical", type=float, default=None,
                          help="V_dd level where the halt-threshold gate is centered.")
+    parser.add_argument(
+        "--amp", action="store_true",
+        help="Enable bf16 autocast on CUDA (off by default; see module "
+             "docstring point 11 -- re-check loss_total for NaN after enabling).",
+    )
+    parser.add_argument("--num_workers", type=int, default=None,
+                         help="DataLoader worker processes (only used when device==cuda).")
+    parser.add_argument("--max_grad_norm", type=float, default=None,
+                         help="Gradient clipping norm (default 1.0). Lower this "
+                              "(e.g. 0.5) if training oscillates/collapses under "
+                              "heavy class weighting.")
     args = parser.parse_args()
 
     cfg = HaltConfig()
@@ -1078,6 +1253,12 @@ def main():
         cfg.gamma_beta = args.gamma_beta
     if args.v_critical is not None:
         cfg.v_critical = args.v_critical
+    if args.amp:
+        cfg.use_amp = True
+    if args.num_workers is not None:
+        cfg.num_workers = args.num_workers
+    if args.max_grad_norm is not None:
+        cfg.max_grad_norm = args.max_grad_norm
 
     set_seed(cfg.seed)
 
@@ -1093,8 +1274,17 @@ def main():
     log_status(f"Run directory: {run_dir}")
     log_status(f"Data directory: {args.data_dir}")
 
+    if cfg.device == "cuda":
+        gpu_name = torch.cuda.get_device_name(0)
+        log_status(f"Device: cuda ({gpu_name})")
+    else:
+        log_status("Device: cpu (no CUDA GPU detected)")
+    effective_num_workers = cfg.num_workers if cfg.device == "cuda" else 0
+    effective_pin_memory = cfg.pin_memory and cfg.device == "cuda"
+
     train_loader, val_loader, test_loader, train_labels, test_base = load_mit_bih_data(
         args.data_dir, t_max=cfg.t_max, batch_size=cfg.batch_size, seed=cfg.seed,
+        num_workers=effective_num_workers, pin_memory=effective_pin_memory,
     )
 
     class_weights = compute_class_weights(train_labels, cfg.num_classes).to(cfg.device)
