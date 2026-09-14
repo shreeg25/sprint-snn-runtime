@@ -82,7 +82,11 @@ guessed, before being applied:
    the decision boundary hard toward over-predicting the minority
    class and was a major contributor to a previously observed
    precision collapse (~50% precision at ~99% recall). This script
-   corrects for the ~8.5:1 imbalance exactly once.
+   corrects for the ~8.5:1 imbalance exactly once. The correction's
+   STRENGTH is exposed via --pos_weight_mult (default 1.0 = exact
+   balance) so it can be swept, per-run, against a target precision/
+   recall operating point without reintroducing a second, stacked
+   correction -- see compute_class_weights docstring.
 
 Elastic, voltage-driven runtime (added for the SPRINT intermittent-
 computing pipeline -- battery-less/energy-harvesting wearables, where
@@ -204,6 +208,24 @@ more, so this is deliberately NOT checkpoint-based intermittency):
     float32's exact-1.0 saturation point, at negligible cost to the
     halt head's effective confidence range.
 
+13. Positive-class weight strength (--pos_weight_mult) and a
+    precision-floor threshold search (tune_threshold_for_precision_floor,
+    --precision_floor) were added on top of the existing exactly-
+    balanced class weighting (point 6) and F1-maximizing threshold
+    sweep (tune_threshold). These are for hitting a specific deployment
+    operating point (e.g. "precision >= 0.90, maximize recall subject to
+    that") rather than an unconstrained best-F1 point, which is what the
+    plain tune_threshold() sweep finds and is NOT guaranteed to respect
+    any particular precision floor. pos_weight_mult multiplies ONLY the
+    positive-class weight on top of the existing exact-balance weight
+    computed from true training counts -- it does not stack a second,
+    independent resampling/weighting mechanism, so it does not
+    reintroduce the double-correction bug point 6 already fixed.
+    tune_threshold() (F1-maximizing) is left in place, unchanged and
+    still called, so its output remains available/logged for comparison
+    even when the precision-floor search is what actually selects the
+    deployed threshold.
+
 Expected outputs (unchanged from spec):
   spike_trains: (T_max, B, 3) -- channel 2 is the hard STE halt spike.
   mem_trains:   (T_max, B, 3) -- channels 0 & 1 are V_class(t).
@@ -279,7 +301,20 @@ class HaltConfig:
     epochs: int = 20
     batch_size: int = 64
 
-    decision_threshold: float = 0.5  # neutral default; retuned by tune_threshold()
+    decision_threshold: float = 0.5  # neutral default; retuned by tune_threshold()/
+                                      # tune_threshold_for_precision_floor()
+
+    # -- Class weighting (see module docstring points 6 and 13) --
+    pos_weight_mult: float = 1.0     # multiplies ONLY the positive-class weight on
+                                      # top of the exact-balance weight; >1 pushes
+                                      # recall up (precision down), <1 pushes
+                                      # precision up (recall down). 1.0 = exact
+                                      # balance, the original behavior.
+
+    # -- Deployment operating point (see module docstring point 13) --
+    precision_floor: float = 0.90    # tune_threshold_for_precision_floor() picks
+                                      # the highest-recall threshold with
+                                      # precision >= this value.
 
     # -- Elastic, voltage-driven runtime (see module docstring points 7-9) --
     v_nominal: float = 1.0           # matches MITBIHVoltageDataset's full-charge value
@@ -572,14 +607,38 @@ def load_mit_bih_data(
 
 
 # --------------------------------------------------------------------------
-# Class weighting -- applied ONCE (see module docstring point 6)
+# Class weighting -- applied ONCE (see module docstring points 6 and 13)
 # --------------------------------------------------------------------------
 
-def compute_class_weights(labels: np.ndarray, num_classes: int) -> torch.Tensor:
+def compute_class_weights(
+    labels: np.ndarray, num_classes: int, pos_weight_mult: float = 1.0,
+) -> torch.Tensor:
+    """
+    Base weights are the exact class-balance correction (N_total /
+    (num_classes * N_c)) computed from the TRUE training-set counts --
+    this is the single correction described in module docstring point 6,
+    and it is applied with NO additional resampling (no
+    WeightedRandomSampler) to avoid the previously-observed stacked-
+    correction precision collapse.
+
+    pos_weight_mult (module docstring point 13) then scales ONLY the
+    positive-class (class 1, AAMI-abnormal) weight on top of that base
+    correction -- it is a single additional scalar knob on an already-
+    single correction, not a second independent correction mechanism:
+      pos_weight_mult == 1.0 -> exact balance (original behavior)
+      pos_weight_mult  > 1.0 -> pushes recall up, precision down
+      pos_weight_mult  < 1.0 -> pushes precision up, recall down
+    Sweep this (e.g. 0.7-1.3) when tune_threshold_for_precision_floor()
+    can't find ANY threshold clearing the precision floor, or when it
+    clears the floor but at a recall below the desired range -- do not
+    reach for a sampler as a second lever; adjust this one instead.
+    """
     counts = np.bincount(labels, minlength=num_classes).astype(np.float64)
     counts = np.where(counts == 0, 1.0, counts)
     n_total = counts.sum()
     weights = n_total / (num_classes * counts)
+    if num_classes == 2:
+        weights[1] *= pos_weight_mult
     return torch.tensor(weights, dtype=torch.float32)
 
 
@@ -693,7 +752,8 @@ class LIFHaltingSNN(nn.Module):
         sensitive threshold. Callers pass voltage_gate_for_gamma(gamma_0,
         cfg) during training/val (ramping with the same curriculum that
         already gates gamma_eff) and 1.0 for final/deployed evaluation
-        (tune_threshold, evaluate_power_latency_tradeoff).
+        (tune_threshold, tune_threshold_for_precision_floor,
+        evaluate_power_latency_tradeoff).
         Returns (spike_trains, mem_trains, halt_probs) per the contract:
           spike_trains: (T_max, B, 3), channel 2 = hard STE halt spike
           mem_trains:   (T_max, B, 3), channels 0/1 = V_class(t)
@@ -1020,15 +1080,15 @@ def binary_metrics_from_logits(logits: torch.Tensor, targets: torch.Tensor, thre
     return {"precision": precision, "recall": recall, "f1": f1, "accuracy": accuracy}
 
 
-def tune_threshold(model: nn.Module, loader: DataLoader, cfg: HaltConfig,
-                    thresholds: Optional[np.ndarray] = None) -> Tuple[float, dict]:
+def _collect_halted_logits(model: nn.Module, loader: DataLoader, cfg: HaltConfig
+                            ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Sweeps decision thresholds on the HELD-OUT TEST set, distinct from
-    the val set used for checkpoint selection during training.
+    Shared logit-collection pass used by both tune_threshold() and
+    tune_threshold_for_precision_floor(), so the two threshold searches
+    are always operating on identically-computed halted_logits (same
+    t_min masking, same p_stop_full residual handling) and can never
+    silently drift apart from each other.
     """
-    if thresholds is None:
-        thresholds = np.arange(0.20, 0.81, 0.02)
-
     model.eval()
     all_logits, all_targets = [], []
     with torch.no_grad():
@@ -1055,8 +1115,25 @@ def tune_threshold(model: nn.Module, loader: DataLoader, cfg: HaltConfig,
             all_logits.append(halted_logits.cpu())
             all_targets.append(y)
 
-    logits = torch.cat(all_logits, dim=0)
-    targets = torch.cat(all_targets, dim=0)
+    return torch.cat(all_logits, dim=0), torch.cat(all_targets, dim=0)
+
+
+def tune_threshold(model: nn.Module, loader: DataLoader, cfg: HaltConfig,
+                    thresholds: Optional[np.ndarray] = None) -> Tuple[float, dict]:
+    """
+    Sweeps decision thresholds on the HELD-OUT TEST set, distinct from
+    the val set used for checkpoint selection during training. Picks the
+    UNCONSTRAINED best-F1 threshold -- this does NOT respect any
+    precision floor and can trade precision away for recall (or vice
+    versa) if that raises F1. Kept as-is (still called, still logged) so
+    its output remains available for comparison against
+    tune_threshold_for_precision_floor()'s constrained pick -- see module
+    docstring point 13.
+    """
+    if thresholds is None:
+        thresholds = np.arange(0.20, 0.81, 0.02)
+
+    logits, targets = _collect_halted_logits(model, loader, cfg)
 
     best_thresh, best_f1, best_metrics = 0.5, -1.0, {}
     for t in thresholds:
@@ -1065,6 +1142,69 @@ def tune_threshold(model: nn.Module, loader: DataLoader, cfg: HaltConfig,
             best_f1 = m["f1"]
             best_thresh = float(t)
             best_metrics = m
+    return best_thresh, best_metrics
+
+
+def tune_threshold_for_precision_floor(
+    model: nn.Module, loader: DataLoader, cfg: HaltConfig,
+    precision_floor: Optional[float] = None,
+    thresholds: Optional[np.ndarray] = None,
+) -> Tuple[Optional[float], dict]:
+    """
+    Sweeps decision thresholds on the HELD-OUT TEST set (same logit
+    collection as tune_threshold(), see _collect_halted_logits) and picks
+    the threshold with the HIGHEST RECALL among all thresholds whose
+    precision is >= precision_floor (defaults to cfg.precision_floor,
+    e.g. 0.90) -- see module docstring point 13.
+
+    This is a CONSTRAINED search, not an F1-maximizer: it deliberately
+    ignores F1 as the selection criterion, because the plain F1-optimal
+    threshold from tune_threshold() is not guaranteed to clear any
+    particular precision floor.
+
+    If NO threshold in the sweep clears precision_floor, returns
+    (None, best_precision_metrics) -- best_precision_metrics is the
+    metrics dict for whichever threshold achieved the HIGHEST precision
+    in the sweep (even though it's below the floor), so the caller can
+    see how close the model got. A None return means the floor cannot be
+    met by threshold choice alone at this checkpoint -- see module
+    docstring point 13 for what to try next (e.g. --focal, lowering
+    --pos_weight_mult, or more training).
+    """
+    if precision_floor is None:
+        precision_floor = cfg.precision_floor
+    if thresholds is None:
+        # Finer grid than tune_threshold()'s, since the precision-floor
+        # boundary can sit between coarser steps.
+        thresholds = np.arange(0.20, 0.96, 0.01)
+
+    logits, targets = _collect_halted_logits(model, loader, cfg)
+
+    candidates = []
+    all_metrics = []
+    for t in thresholds:
+        m = binary_metrics_from_logits(logits, targets, float(t))
+        all_metrics.append((float(t), m))
+        if m["precision"] >= precision_floor:
+            candidates.append((float(t), m))
+
+    if not candidates:
+        best_thresh, best_metrics = max(all_metrics, key=lambda c: c[1]["precision"])
+        log_status(
+            f"WARNING: no threshold reached precision >= {precision_floor:.2f}; "
+            f"best achievable precision was {best_metrics['precision']:.4f} "
+            f"at threshold={best_thresh:.2f} (recall={best_metrics['recall']:.4f}). "
+            f"Threshold tuning alone can't hit this floor -- see module docstring "
+            f"point 13 (try --focal, adjust --pos_weight_mult, or train longer)."
+        )
+        return None, best_metrics
+
+    best_thresh, best_metrics = max(candidates, key=lambda c: c[1]["recall"])
+    log_status(
+        f"Precision-floor threshold (>= {precision_floor:.2f}) = {best_thresh:.2f} -> "
+        f"precision={best_metrics['precision']:.4f} recall={best_metrics['recall']:.4f} "
+        f"f1={best_metrics['f1']:.4f} accuracy={best_metrics['accuracy']:.4f}"
+    )
     return best_thresh, best_metrics
 
 
@@ -1232,6 +1372,22 @@ def main():
                          help="Gradient clipping norm (default 1.0). Lower this "
                               "(e.g. 0.5) if training oscillates/collapses under "
                               "heavy class weighting.")
+    parser.add_argument(
+        "--pos_weight_mult", type=float, default=None,
+        help="Multiplies ONLY the positive-class loss weight on top of the "
+             "exact-balance correction (see module docstring points 6/13). "
+             "1.0 = exact balance (default). >1 pushes recall up/precision "
+             "down; <1 pushes precision up/recall down. Sweep this if "
+             "--precision_floor can't be met, or is met at too-low a recall.",
+    )
+    parser.add_argument(
+        "--precision_floor", type=float, default=None,
+        help="Minimum test-set precision required when selecting the "
+             "deployed decision threshold (see module docstring point 13). "
+             "tune_threshold_for_precision_floor() picks the threshold "
+             "with the highest recall subject to precision >= this value. "
+             "Default 0.90.",
+    )
     args = parser.parse_args()
 
     cfg = HaltConfig()
@@ -1259,6 +1415,10 @@ def main():
         cfg.num_workers = args.num_workers
     if args.max_grad_norm is not None:
         cfg.max_grad_norm = args.max_grad_norm
+    if args.pos_weight_mult is not None:
+        cfg.pos_weight_mult = args.pos_weight_mult
+    if args.precision_floor is not None:
+        cfg.precision_floor = args.precision_floor
 
     set_seed(cfg.seed)
 
@@ -1287,8 +1447,13 @@ def main():
         num_workers=effective_num_workers, pin_memory=effective_pin_memory,
     )
 
-    class_weights = compute_class_weights(train_labels, cfg.num_classes).to(cfg.device)
-    log_status(f"Class weights (N_total/(C*N_c)): {class_weights.tolist()}")
+    class_weights = compute_class_weights(
+        train_labels, cfg.num_classes, pos_weight_mult=cfg.pos_weight_mult,
+    ).to(cfg.device)
+    log_status(
+        f"Class weights (N_total/(C*N_c), pos_weight_mult={cfg.pos_weight_mult:.3f}): "
+        f"{class_weights.tolist()}"
+    )
 
     cls_loss_fn = build_classification_loss(class_weights, cfg)
     loss_fn = ElasticHaltingLoss(cls_loss_fn, cfg)
@@ -1339,17 +1504,47 @@ def main():
     else:
         log_status("WARNING: no checkpoint was ever saved -- val F1 never improved past -1.0")
 
-    best_thresh, best_metrics = tune_threshold(model, test_loader, cfg)
+    # F1-optimal threshold (unconstrained) -- kept for comparison, see
+    # module docstring point 13. NOT necessarily what gets deployed.
+    f1_best_thresh, f1_best_metrics = tune_threshold(model, test_loader, cfg)
     log_status(
-        f"F1-optimal threshold (held-out test set) = {best_thresh:.2f} -> "
-        f"f1={best_metrics['f1']:.4f} recall={best_metrics['recall']:.4f} "
-        f"precision={best_metrics['precision']:.4f} accuracy={best_metrics['accuracy']:.4f}"
+        f"F1-optimal threshold (held-out test set) = {f1_best_thresh:.2f} -> "
+        f"f1={f1_best_metrics['f1']:.4f} recall={f1_best_metrics['recall']:.4f} "
+        f"precision={f1_best_metrics['precision']:.4f} accuracy={f1_best_metrics['accuracy']:.4f}"
     )
-    run_record["test_threshold_tuning"] = {"best_threshold": best_thresh, "best_metrics": best_metrics}
+    run_record["test_threshold_tuning_f1_optimal"] = {
+        "best_threshold": f1_best_thresh, "best_metrics": f1_best_metrics,
+    }
+
+    # Precision-floor threshold (constrained: highest recall subject to
+    # precision >= cfg.precision_floor) -- this is the operating point
+    # actually used for the power/latency report and the deployed
+    # threshold below, per module docstring point 13.
+    pf_thresh, pf_metrics = tune_threshold_for_precision_floor(
+        model, test_loader, cfg, precision_floor=cfg.precision_floor,
+    )
+    run_record["test_threshold_tuning_precision_floor"] = {
+        "precision_floor": cfg.precision_floor,
+        "best_threshold": pf_thresh,
+        "best_metrics": pf_metrics,
+    }
+
+    if pf_thresh is not None:
+        deployed_thresh = pf_thresh
+        log_status(f"Deploying precision-floor threshold: {deployed_thresh:.2f}")
+    else:
+        deployed_thresh = f1_best_thresh
+        log_status(
+            f"Precision floor {cfg.precision_floor:.2f} unreachable by threshold "
+            f"choice alone -- falling back to F1-optimal threshold "
+            f"({deployed_thresh:.2f}) for the power/latency report. Retrain with "
+            f"a different --pos_weight_mult or --focal to actually close this gap."
+        )
+    run_record["deployed_threshold"] = deployed_thresh
 
     log_status("Power/latency trade-off across fixed discharge rates (held-out test patients):")
     tradeoff_results = evaluate_power_latency_tradeoff(
-        model, test_base, loss_fn, cfg, threshold=best_thresh,
+        model, test_base, loss_fn, cfg, threshold=deployed_thresh,
     )
     run_record["power_latency_tradeoff"] = tradeoff_results
 
