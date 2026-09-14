@@ -1,0 +1,475 @@
+{
+    "config": {
+        "t_max": 100,
+        "t_target": 40.0,
+        "num_classes": 2,
+        "t_min": 10,
+        "warmup_epochs": 5,
+        "gamma_max": 0.5,
+        "gamma_step": 0.02,
+        "full_loss_weight": 0.5,
+        "use_focal_loss": false,
+        "focal_gamma": 2.0,
+        "hidden": 64,
+        "v_max": 50.0,
+        "beta": 0.9,
+        "lr": 0.001,
+        "weight_decay": 0.0001,
+        "max_grad_norm": 1.0,
+        "epochs": 20,
+        "batch_size": 64,
+        "decision_threshold": 0.5,
+        "v_nominal": 1.0,
+        "v_critical": 0.3,
+        "gamma_alpha": 2.0,
+        "gamma_beta": 1.0,
+        "gamma_eff_smooth_window": 5,
+        "gamma_eff_clip_mult": 5.0,
+        "lambda_base": 0.5,
+        "lambda_k": 10.0,
+        "eval_alpha_grid": [
+            0.003,
+            0.006,
+            0.01,
+            0.014,
+            0.02,
+            0.028
+        ],
+        "seed": 42,
+        "device": "cuda"
+    },
+    "epochs": [
+        {
+            "epoch": 0,
+            "phase": "WARM-UP",
+            "gamma": 0.0,
+            "time_sec": 165.1869637966156,
+            "train_stats": {
+                "loss_total": 1.0494349332171191,
+                "loss_ce_halt": 0.712241870101092,
+                "loss_ce_full": 0.6743861240577605,
+                "loss_latency": 0.0,
+                "mean_t_halt": 15.968178783409327,
+                "mean_gamma_eff": 0.0,
+                "mean_v_dd_at_halt": 0.8153755170246043,
+                "mean_lambda_threshold": 0.3104170070895889
+            },
+            "val_metrics": {
+                "precision": 0.11745478317716278,
+                "recall": 1.0,
+                "f1": 0.21021840873634945,
+                "accuracy": 0.11745478317716278,
+                "loss_total": 7.459302178788476,
+                "mean_t_halt": 15.453296030024617,
+                "mean_gamma_eff": 0.0,
+                "mean_v_dd_at_halt": 0.8256321146513111,
+                "mean_lambda_threshold": 0.31179208892563076
+            }
+        },
+        {
+            "epoch": 1,
+            "phase": "WARM-UP",
+            "gamma": 0.0,
+            "time_sec": 165.53512001037598,
+            "train_stats": {
+                "loss_total": NaN,
+                "loss_ce_halt": NaN,
+                "loss_ce_full": NaN,
+                "loss_latency": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.3100150977823057
+            },
+            "val_metrics": {
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1": 0.0,
+                "accuracy": 0.8825452168228373,
+                "loss_total": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.3106006257210044
+            }
+        },
+        {
+            "epoch": 2,
+            "phase": "WARM-UP",
+            "gamma": 0.0,
+            "time_sec": 163.5365858078003,
+            "train_stats": {
+                "loss_total": NaN,
+                "loss_ce_halt": NaN,
+                "loss_ce_full": NaN,
+                "loss_latency": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.31013704349326715
+            },
+            "val_metrics": {
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1": 0.0,
+                "accuracy": 0.8825452168228373,
+                "loss_total": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.31110325185679394
+            }
+        },
+        {
+            "epoch": 3,
+            "phase": "WARM-UP",
+            "gamma": 0.0,
+            "time_sec": 164.09514141082764,
+            "train_stats": {
+                "loss_total": NaN,
+                "loss_ce_halt": NaN,
+                "loss_ce_full": NaN,
+                "loss_latency": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.31032947778469855
+            },
+            "val_metrics": {
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1": 0.0,
+                "accuracy": 0.8825452168228373,
+                "loss_total": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.3097170996333664
+            }
+        },
+        {
+            "epoch": 4,
+            "phase": "WARM-UP",
+            "gamma": 0.0,
+            "time_sec": 166.29454112052917,
+            "train_stats": {
+                "loss_total": NaN,
+                "loss_ce_halt": NaN,
+                "loss_ce_full": NaN,
+                "loss_latency": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.310764894324286
+            },
+            "val_metrics": {
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1": 0.0,
+                "accuracy": 0.8825452168228373,
+                "loss_total": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.31043953554970877
+            }
+        },
+        {
+            "epoch": 5,
+            "phase": "CURRICULUM",
+            "gamma": 0.02,
+            "time_sec": 143.57998132705688,
+            "train_stats": {
+                "loss_total": NaN,
+                "loss_ce_halt": NaN,
+                "loss_ce_full": NaN,
+                "loss_latency": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.3104604729070738
+            },
+            "val_metrics": {
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1": 0.0,
+                "accuracy": 0.8825452168228373,
+                "loss_total": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.31048756547090484
+            }
+        },
+        {
+            "epoch": 6,
+            "phase": "CURRICULUM",
+            "gamma": 0.04,
+            "time_sec": 139.75980806350708,
+            "train_stats": {
+                "loss_total": NaN,
+                "loss_ce_halt": NaN,
+                "loss_ce_full": NaN,
+                "loss_latency": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.3103229232161425
+            },
+            "val_metrics": {
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1": 0.0,
+                "accuracy": 0.8825452168228373,
+                "loss_total": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.31016616746523656
+            }
+        },
+        {
+            "epoch": 7,
+            "phase": "CURRICULUM",
+            "gamma": 0.06,
+            "time_sec": 150.55928325653076,
+            "train_stats": {
+                "loss_total": NaN,
+                "loss_ce_halt": NaN,
+                "loss_ce_full": NaN,
+                "loss_latency": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.31005415685677806
+            },
+            "val_metrics": {
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1": 0.0,
+                "accuracy": 0.8825452168228373,
+                "loss_total": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.3102237647626458
+            }
+        },
+        {
+            "epoch": 8,
+            "phase": "CURRICULUM",
+            "gamma": 0.08,
+            "time_sec": 150.08692836761475,
+            "train_stats": {
+                "loss_total": NaN,
+                "loss_ce_halt": NaN,
+                "loss_ce_full": NaN,
+                "loss_latency": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.3104360326254878
+            },
+            "val_metrics": {
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1": 0.0,
+                "accuracy": 0.8825452168228373,
+                "loss_total": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.3096447498748527
+            }
+        },
+        {
+            "epoch": 9,
+            "phase": "CURRICULUM",
+            "gamma": 0.1,
+            "time_sec": 181.61450505256653,
+            "train_stats": {
+                "loss_total": NaN,
+                "loss_ce_halt": NaN,
+                "loss_ce_full": NaN,
+                "loss_latency": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.3111852703159421
+            },
+            "val_metrics": {
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1": 0.0,
+                "accuracy": 0.8825452168228373,
+                "loss_total": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.3110889657449224
+            }
+        },
+        {
+            "epoch": 10,
+            "phase": "CURRICULUM",
+            "gamma": 0.12,
+            "time_sec": 186.40682697296143,
+            "train_stats": {
+                "loss_total": NaN,
+                "loss_ce_halt": NaN,
+                "loss_ce_full": NaN,
+                "loss_latency": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.31025141509474485
+            },
+            "val_metrics": {
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1": 0.0,
+                "accuracy": 0.8825452168228373,
+                "loss_total": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.31108690575024806
+            }
+        },
+        {
+            "epoch": 11,
+            "phase": "CURRICULUM",
+            "gamma": 0.14,
+            "time_sec": 168.7217948436737,
+            "train_stats": {
+                "loss_total": NaN,
+                "loss_ce_halt": NaN,
+                "loss_ce_full": NaN,
+                "loss_latency": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.3109234757866377
+            },
+            "val_metrics": {
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1": 0.0,
+                "accuracy": 0.8825452168228373,
+                "loss_total": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.31091893290393446
+            }
+        },
+        {
+            "epoch": 12,
+            "phase": "CURRICULUM",
+            "gamma": 0.16,
+            "time_sec": 163.70136499404907,
+            "train_stats": {
+                "loss_total": NaN,
+                "loss_ce_halt": NaN,
+                "loss_ce_full": NaN,
+                "loss_latency": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.31084386613002546
+            },
+            "val_metrics": {
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1": 0.0,
+                "accuracy": 0.8825452168228373,
+                "loss_total": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.3104497031260035
+            }
+        },
+        {
+            "epoch": 13,
+            "phase": "CURRICULUM",
+            "gamma": 0.18,
+            "time_sec": 185.0007164478302,
+            "train_stats": {
+                "loss_total": NaN,
+                "loss_ce_halt": NaN,
+                "loss_ce_full": NaN,
+                "loss_latency": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.310458567094942
+            },
+            "val_metrics": {
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1": 0.0,
+                "accuracy": 0.8825452168228373,
+                "loss_total": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.31116896961208834
+            }
+        },
+        {
+            "epoch": 14,
+            "phase": "CURRICULUM",
+            "gamma": 0.2,
+            "time_sec": 172.67483925819397,
+            "train_stats": {
+                "loss_total": NaN,
+                "loss_ce_halt": NaN,
+                "loss_ce_full": NaN,
+                "loss_latency": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.3103693911827492
+            },
+            "val_metrics": {
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1": 0.0,
+                "accuracy": 0.8825452168228373,
+                "loss_total": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.310401144447227
+            }
+        },
+        {
+            "epoch": 15,
+            "phase": "CURRICULUM",
+            "gamma": 0.22,
+            "time_sec": 175.1735122203827,
+            "train_stats": {
+                "loss_total": NaN,
+                "loss_ce_halt": NaN,
+                "loss_ce_full": NaN,
+                "loss_latency": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.31032663905551
+            },
+            "val_metrics": {
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1": 0.0,
+                "accuracy": 0.8825452168228373,
+                "loss_total": NaN,
+                "mean_t_halt": NaN,
+                "mean_gamma_eff": NaN,
+                "mean_v_dd_at_halt": NaN,
+                "mean_lambda_threshold": 0.3113442373815729
+            }
+        }
+    ]
+}
