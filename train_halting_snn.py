@@ -285,7 +285,7 @@ class HaltConfig:
 
     warmup_epochs: int = 5
     gamma_max: float = 0.5
-    gamma_step: float = 0.02
+    gamma_step: float = 0.05
 
     full_loss_weight: float = 0.5
     use_focal_loss: bool = False
@@ -1357,6 +1357,13 @@ def main():
     )
     parser.add_argument("--gamma_alpha", type=float, default=None,
                          help="Weight on |delta V_dd| in gamma_eff.")
+    parser.add_argument("--gamma_step", type=float, default=None,
+                         help="Per-epoch increment added to gamma_0 during curriculum "
+                              "(see gamma_for_epoch). Set this so warmup_epochs-to-epochs "
+                              "gives gamma_step * (epochs - warmup_epochs) >= gamma_max, "
+                              "or voltage_gate never reaches 1.0 during training even "
+                              "though tune_threshold/evaluate_power_latency_tradeoff "
+                              "evaluate at voltage_gate=1.0 — a train/deploy mismatch.")
     parser.add_argument("--gamma_beta", type=float, default=None,
                          help="Weight on (V_nominal - V_dd) in gamma_eff.")
     parser.add_argument("--v_critical", type=float, default=None,
@@ -1405,6 +1412,8 @@ def main():
         cfg.lambda_base = args.lambda_base
     if args.gamma_alpha is not None:
         cfg.gamma_alpha = args.gamma_alpha
+    if args.gamma_step is not None:
+        cfg.gamma_step = args.gamma_step
     if args.gamma_beta is not None:
         cfg.gamma_beta = args.gamma_beta
     if args.v_critical is not None:
@@ -1461,8 +1470,12 @@ def main():
     in_features = 3  # ECG channel + V_dd channel + delta_V_dd channel
     model = build_model(in_features=in_features, cfg=cfg).to(cfg.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=2, min_lr=1e-6,
+    )
 
     best_f1 = -1.0
+    best_score = -1.0
     best_state = None
     run_record = {"config": asdict(cfg), "epochs": []}
 
@@ -1473,6 +1486,7 @@ def main():
         t0 = time.time()
         train_stats = train_one_epoch(model, train_loader, loss_fn, optimizer, gamma, cfg)
         val_metrics = evaluate(model, val_loader, loss_fn, gamma, cfg, threshold=cfg.decision_threshold)
+        scheduler.step(val_metrics["f1"])
         dt = time.time() - t0
 
         print(
@@ -1486,18 +1500,32 @@ def main():
             f"F1: {val_metrics['f1']*100:.1f}%"
         )
 
+        val_pf_thresh, val_pf_metrics = tune_threshold_for_precision_floor(
+            model, val_loader, cfg, precision_floor=cfg.precision_floor,
+        )
+        if val_pf_thresh is not None:
+            score = 1.0 + val_pf_metrics["recall"]
+            score_desc = f"recall={val_pf_metrics['recall']:.4f} @ precision>={cfg.precision_floor:.2f} (val)"
+        else:
+            score = val_pf_metrics["precision"]
+            score_desc = f"floor not reached, best val precision={val_pf_metrics['precision']:.4f}"
+
         run_record["epochs"].append({
             "epoch": epoch, "phase": phase, "gamma": gamma, "time_sec": dt,
             "train_stats": train_stats, "val_metrics": val_metrics,
+            "val_precision_floor_check": {"threshold": val_pf_thresh, "metrics": val_pf_metrics},
         })
         with open(metrics_path, "w") as f:
             json.dump(run_record, f, indent=4)
 
         if val_metrics["f1"] > best_f1:
             best_f1 = val_metrics["f1"]
+
+        if score > best_score:
+            best_score = score
             best_state = copy.deepcopy(model.state_dict())
             torch.save(best_state, checkpoint_path)
-            print(f"  -> new best val F1 ({best_f1:.4f}), checkpoint saved")
+            print(f"  -> new best checkpoint ({score_desc}), saved")
 
     if best_state is not None:
         model.load_state_dict(best_state)
