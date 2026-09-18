@@ -247,6 +247,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import wfdb
+from sklearn.metrics import average_precision_score
 from torch.utils.data import DataLoader, Dataset
 
 
@@ -318,7 +319,22 @@ class HaltConfig:
 
     # -- Elastic, voltage-driven runtime (see module docstring points 7-9) --
     v_nominal: float = 1.0           # matches MITBIHVoltageDataset's full-charge value
+    # Per-sample random discharge range used for train/val/test loaders
+    # (distinct from eval_alpha_grid's FIXED rates below, used only for
+    # the post-training power/latency sweep). Widened from the original
+    # (0.005, 0.02) to (0.005, 0.03) so eval_alpha_grid's high-alpha
+    # points (0.02, 0.028) fall INSIDE the training distribution instead
+    # of past its edge -- the earlier AP collapse at alpha>=0.02 lined up
+    # almost exactly with the old range's upper bound, consistent with
+    # an out-of-distribution generalization gap rather than (or in
+    # addition to) an architectural entanglement problem.
+    train_alpha_range: Tuple[float, float] = (0.005, 0.03)
     v_critical: float = 0.3          # V_dd domain is ~[0,1]; see docstring point 9
+    v_emergency: float = 0.05        # hard emergency-exit floor: if V_dd[t] drops below
+                                      # this, halt_spike_t is forced to 1 regardless of
+                                      # the learned head, as a brownout safety net --
+                                      # independent of and in addition to the learned
+                                      # voltage-gated threshold lambda(V_dd) above.
 
     gamma_alpha: float = 2.0         # weight on |delta V_dd| in gamma_eff
     gamma_beta: float = 1.0          # weight on (V_nominal - V_dd) in gamma_eff
@@ -424,6 +440,19 @@ def stratified_patient_split(
             f"Split '{name}': {len(ids)} patients, {tot} beats, "
             f"positive_rate={pos/tot:.4f}" if tot else f"Split '{name}': empty"
         )
+
+    # Per-patient breakdown for val/test specifically (not train, to keep
+    # the log readable) -- with only 8 patients per split, a handful of
+    # atypical patients can dominate aggregate precision/recall/F1 on
+    # their own. This makes that visible directly, instead of inferring
+    # it from a val/test metric gap after the fact. Sorted by positive
+    # rate so outlier patients (near-0% or very high %) stand out.
+    for name, ids in [("val", val_ids), ("test", test_ids)]:
+        log_status(f"  Per-patient breakdown for '{name}':")
+        for rid in sorted(ids, key=lambda i: by_id[i][3]):
+            _, n_tot, n_pos, rate = by_id[rid]
+            log_status(f"    patient {rid}: {n_tot} beats, {n_pos} positive, rate={rate:.4f}")
+
     return train_ids, val_ids, test_ids
 
 
@@ -571,6 +600,7 @@ def extract_energy_channels(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor
 def load_mit_bih_data(
     data_dir: str, t_max: int = 100, batch_size: int = 64, seed: int = 42,
     num_workers: int = 0, pin_memory: bool = False,
+    alpha_range: Tuple[float, float] = (0.005, 0.03),
 ) -> Tuple[DataLoader, DataLoader, DataLoader, np.ndarray, Dataset]:
     train_ids, val_ids, test_ids = stratified_patient_split(data_dir, seed=seed)
 
@@ -582,9 +612,14 @@ def load_mit_bih_data(
 
     # Distinct RNG seeds per split so val/test V_dd curves aren't
     # identical draws to train's, while still being reproducible.
-    train_ds = MITBIHVoltageDataset(train_base, seed=seed)
-    val_ds = MITBIHVoltageDataset(val_base, seed=seed + 1)
-    test_ds = MITBIHVoltageDataset(test_base, seed=seed + 2)
+    # alpha_range is shared across train/val/test (see HaltConfig.
+    # train_alpha_range) so val/test discharge curves are drawn from the
+    # SAME distribution the model was trained on, not a narrower one --
+    # otherwise val/test would be silently easier than the eval_alpha_grid
+    # sweep, which specifically probes the edges of this range.
+    train_ds = MITBIHVoltageDataset(train_base, alpha_range=alpha_range, seed=seed)
+    val_ds = MITBIHVoltageDataset(val_base, alpha_range=alpha_range, seed=seed + 1)
+    test_ds = MITBIHVoltageDataset(test_base, alpha_range=alpha_range, seed=seed + 2)
 
     # pin_memory + persistent_workers only help on a CUDA run (pinned
     # host buffers speed up the async H2D copy paired with non_blocking
@@ -715,7 +750,7 @@ class LIFHaltingSNN(nn.Module):
 
     def __init__(self, in_features: int, hidden: int, t_max: int, beta: float = 0.9,
                  v_max: float = 50.0, lambda_base: float = 0.5, lambda_k: float = 10.0,
-                 v_critical: float = 0.3, t_min: int = 10):
+                 v_critical: float = 0.3, t_min: int = 10, v_emergency: float = 0.05):
         super().__init__()
         self.t_max = t_max
         self.hidden = hidden
@@ -732,6 +767,10 @@ class LIFHaltingSNN(nn.Module):
         # t_min is ALSO enforced here (not just in the loss's soft
         # p_stop expectation) -- see module docstring point 10.
         self.t_min = t_min
+        # Hard emergency-exit floor: independent safety net on top of the
+        # learned voltage-gated threshold, NOT a substitute for it -- see
+        # module docstring point 14 / HaltConfig.v_emergency.
+        self.v_emergency = v_emergency
 
         self.encoder = nn.Linear(in_features, hidden)
         self.recurrent_weights = nn.Linear(hidden, hidden, bias=False)
@@ -826,6 +865,17 @@ class LIFHaltingSNN(nn.Module):
                 halt_spike_t = (halt_prob_t > lambda_t).float()
                 halt_spike_t = halt_spike_t + (halt_prob_t - halt_prob_t.detach())  # STE
 
+                # Hard emergency-exit floor (defense-in-depth, same
+                # philosophy as t_min and the logit clamp): if V_dd[t] has
+                # dropped below v_emergency, force the hard spike to 1
+                # regardless of what halt_prob_t/lambda_t say. This does
+                # NOT touch halt_prob_t itself or the STE gradient path
+                # above -- it only overrides the HARD spike decision (same
+                # as the t < t_min branch does), so it guards against a
+                # brownout without changing what the loss trains against.
+                emergency = (v_dd_seq[:, t] < self.v_emergency).float().detach()
+                halt_spike_t = torch.maximum(halt_spike_t, emergency)
+
             class_mem_t = self.class_head(v_mem)  # reads accumulated evidence, not instantaneous input
 
             mem_trains[t, :, :2] = class_mem_t
@@ -846,7 +896,7 @@ def build_model(in_features: int, cfg: HaltConfig) -> nn.Module:
         in_features=in_features, hidden=cfg.hidden, t_max=cfg.t_max,
         beta=cfg.beta, v_max=cfg.v_max,
         lambda_base=cfg.lambda_base, lambda_k=cfg.lambda_k, v_critical=cfg.v_critical,
-        t_min=cfg.t_min,
+        t_min=cfg.t_min, v_emergency=cfg.v_emergency,
     )
 
 
@@ -1285,6 +1335,93 @@ def evaluate(model, loader, loss_fn, gamma, cfg, threshold: float) -> dict:
     return metrics
 
 
+def _diagnose_halt_vs_lambda_and_ap(
+    model: nn.Module, loader: DataLoader, cfg: HaltConfig, voltage_gate: float = 1.0,
+    windows: Optional[List[Tuple[int, int]]] = None,
+) -> dict:
+    """
+    Directly tests the "halt_prob_t collapses faster than lambda_t decays"
+    hypothesis with measured values, rather than inferring it from T_halt
+    behavior alone. Runs ONE full (non-early-exit) forward pass, collecting:
+      - halt_probs (T, B): the model's own continuous halt probability.
+      - lambda_trace (T, B): the voltage-gated threshold, recomputed here
+        via the exact same formula forward()/the loss use internally
+        (forward() doesn't currently return lambda_t as an output, so it
+        has to be recomputed from v_dd rather than read off the model).
+
+    Reports the mean of each over EVERY window in `windows`, not just one:
+    the first run's diagnostic only checked t=10:20, which is well before
+    the model's actual mean exit time (observed ~27-34 in that run) -- a
+    "suppression" effect could easily show up later in the sequence even
+    if it isn't visible that early. Default windows cover an early band
+    (past t_min, before most halting has happened) and a late band
+    (bracketing where halting actually tends to occur), so both get
+    checked from ONE forward pass rather than guessing which window to use
+    or paying for a second pass.
+
+    Also computes Average Precision (PR-AUC) on this alpha's logits, to
+    separate "ranking quality is fine, just need a different threshold"
+    from "ranking quality itself has degraded under this V_dd regime."
+    """
+    if windows is None:
+        windows = [(10, 20), (25, 40)]  # early band, late/near-exit band
+
+    model.eval()
+    all_halt_probs, all_v_dd, all_logits, all_targets = [], [], [], []
+    with torch.no_grad():
+        for x, y in loader:
+            x = x.to(cfg.device, non_blocking=True)
+            v_dd, _ = extract_energy_channels(x)  # (B, T)
+            _, mem_trains, halt_probs = model(x, early_exit=False, voltage_gate=voltage_gate)
+            class_mem = mem_trains[:, :, :2]
+
+            p_halt = halt_probs
+            if cfg.t_min > 1:
+                p_halt = torch.cat(
+                    [torch.zeros_like(halt_probs[: cfg.t_min - 1]), halt_probs[cfg.t_min - 1:]],
+                    dim=0,
+                )
+            continue_prob = 1.0 - p_halt
+            shifted = torch.cat([torch.ones_like(continue_prob[:1]), continue_prob[:-1]], dim=0)
+            S = torch.cumprod(shifted, dim=0)
+            p_stop = S * p_halt
+            residual = S[-1] * (1.0 - p_halt[-1])
+            p_stop_full = p_stop.clone()
+            p_stop_full[-1] = p_stop_full[-1] + residual
+            halted_logits = (p_stop_full.unsqueeze(-1) * class_mem).sum(dim=0)
+
+            all_halt_probs.append(halt_probs.cpu())        # (T, B)
+            all_v_dd.append(v_dd.cpu())                     # (B, T)
+            all_logits.append(halted_logits.cpu())
+            all_targets.append(y)
+
+    halt_probs_cat = torch.cat(all_halt_probs, dim=1)          # (T, sum_B)
+    v_dd_cat = torch.cat(all_v_dd, dim=0).transpose(0, 1)      # (T, sum_B)
+    logits = torch.cat(all_logits, dim=0)
+    targets = torch.cat(all_targets, dim=0)
+
+    lambda_trace = cfg.lambda_base * (
+        (1.0 - voltage_gate)
+        + voltage_gate * torch.sigmoid(cfg.lambda_k * (v_dd_cat - cfg.v_critical))
+    )  # (T, sum_B), mirrors the model's internal (gated) threshold
+
+    window_stats = []
+    for lo, hi in windows:
+        window_stats.append({
+            "window": [lo, hi],
+            "mean_halt_prob": halt_probs_cat[lo:hi].mean().item(),
+            "mean_lambda": lambda_trace[lo:hi].mean().item(),
+        })
+
+    probs_pos = torch.softmax(logits, dim=-1)[:, 1].numpy()
+    ap = average_precision_score(targets.numpy(), probs_pos)
+
+    return {
+        "window_stats": window_stats,
+        "average_precision": float(ap),
+    }
+
+
 def evaluate_power_latency_tradeoff(
     model: nn.Module, test_base: Dataset, loss_fn: nn.Module, cfg: HaltConfig,
     threshold: float,
@@ -1311,14 +1448,21 @@ def evaluate_power_latency_tradeoff(
                              pin_memory=cfg.pin_memory and cfg.device == "cuda")
         metrics = evaluate(model, loader, loss_fn, gamma=cfg.gamma_max, cfg=cfg,
                             threshold=threshold)
-        row = {"alpha": alpha, **metrics}
+        diag = _diagnose_halt_vs_lambda_and_ap(model, loader, cfg, voltage_gate=1.0)
+        row = {"alpha": alpha, **metrics, **diag}
         results.append(row)
+        window_str = " | ".join(
+            f"halt_prob[{w['window'][0]}:{w['window'][1]}]={w['mean_halt_prob']:.4f} "
+            f"lambda_t[{w['window'][0]}:{w['window'][1]}]={w['mean_lambda']:.4f}"
+            for w in diag["window_stats"]
+        )
         log_status(
             f"  alpha={alpha:.4f} | F1={row['f1']*100:.1f}% | "
             f"<T_exit>={row['mean_t_halt']:.1f} | "
             f"mean_lambda={row['mean_lambda_threshold']:.3f} | "
             f"mean_gamma_eff={row['mean_gamma_eff']:.3f} | "
-            f"E[V_dd@halt]={row['mean_v_dd_at_halt']:.3f}"
+            f"E[V_dd@halt]={row['mean_v_dd_at_halt']:.3f} | "
+            f"{window_str} | AP={diag['average_precision']:.4f}"
         )
     return results
 
@@ -1368,6 +1512,21 @@ def main():
                          help="Weight on (V_nominal - V_dd) in gamma_eff.")
     parser.add_argument("--v_critical", type=float, default=None,
                          help="V_dd level where the halt-threshold gate is centered.")
+    parser.add_argument("--v_emergency", type=float, default=None,
+                         help="Hard emergency-exit V_dd floor (default 0.05). If V_dd[t] "
+                              "drops below this, the model force-halts regardless of the "
+                              "learned threshold -- a brownout safety net, independent of "
+                              "and in addition to --v_critical/lambda gating.")
+    parser.add_argument("--alpha_low", type=float, default=None,
+                         help="Lower bound of the per-sample random V_dd discharge rate "
+                              "used for train/val/test (see HaltConfig.train_alpha_range). "
+                              "Default 0.005.")
+    parser.add_argument("--alpha_high", type=float, default=None,
+                         help="Upper bound of the per-sample random V_dd discharge rate "
+                              "used for train/val/test (see HaltConfig.train_alpha_range). "
+                              "Default 0.03 -- widened from the original 0.02 so "
+                              "eval_alpha_grid's high-alpha points (0.02, 0.028) fall "
+                              "inside the training distribution instead of past its edge.")
     parser.add_argument(
         "--amp", action="store_true",
         help="Enable bf16 autocast on CUDA (off by default; see module "
@@ -1418,6 +1577,12 @@ def main():
         cfg.gamma_beta = args.gamma_beta
     if args.v_critical is not None:
         cfg.v_critical = args.v_critical
+    if args.v_emergency is not None:
+        cfg.v_emergency = args.v_emergency
+    if args.alpha_low is not None or args.alpha_high is not None:
+        lo = args.alpha_low if args.alpha_low is not None else cfg.train_alpha_range[0]
+        hi = args.alpha_high if args.alpha_high is not None else cfg.train_alpha_range[1]
+        cfg.train_alpha_range = (lo, hi)
     if args.amp:
         cfg.use_amp = True
     if args.num_workers is not None:
@@ -1454,6 +1619,7 @@ def main():
     train_loader, val_loader, test_loader, train_labels, test_base = load_mit_bih_data(
         args.data_dir, t_max=cfg.t_max, batch_size=cfg.batch_size, seed=cfg.seed,
         num_workers=effective_num_workers, pin_memory=effective_pin_memory,
+        alpha_range=cfg.train_alpha_range,
     )
 
     class_weights = compute_class_weights(
