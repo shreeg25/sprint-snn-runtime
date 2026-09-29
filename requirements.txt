@@ -1,8 +1,8 @@
 torch>=2.2
 torchvision>=0.17
 snntorch==0.6.2
-wfdb==4.1.2
+wfdb>=4.3.1  # 4.1.2 fails on numpy 2 (uint8 overflow in rdann)
 numpy>=1.25
 matplotlib
 scikit-learn
-pandas>=1.5.3,<3  # wfdb 4.1.2 breaks on pandas 3 string dtype
+pandas>=1.5.3,<3
