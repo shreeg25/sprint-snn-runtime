@@ -1,8 +1,8 @@
-torch==2.0.1
-torchvision==0.15.2
+torch>=2.2
+torchvision>=0.17
 snntorch==0.6.2
 wfdb==4.1.2
-numpy==1.25
+numpy>=1.25
 matplotlib
 scikit-learn
-pandas==1.5.3 
+pandas>=1.5.3
