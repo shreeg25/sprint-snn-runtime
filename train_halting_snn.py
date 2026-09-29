@@ -1130,6 +1130,12 @@ def binary_metrics_from_logits(logits: torch.Tensor, targets: torch.Tensor, thre
     return {"precision": precision, "recall": recall, "f1": f1, "accuracy": accuracy}
 
 
+def compute_val_auprc(logits: torch.Tensor, targets: torch.Tensor) -> float:
+    probs = torch.softmax(logits.float(), dim=-1)[:, 1].numpy()
+    targets_np = targets.numpy()
+    return float(average_precision_score(targets_np, probs))
+
+
 def _collect_halted_logits(model: nn.Module, loader: DataLoader, cfg: HaltConfig
                             ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -1332,6 +1338,8 @@ def evaluate(model, loader, loss_fn, gamma, cfg, threshold: float) -> dict:
     metrics["loss_total"] = running_loss / max(1, n_batches)
     for k, v in diag_running.items():
         metrics[k] = v / max(1, n_batches)
+    metrics["_val_logits"] = logits
+    metrics["_val_targets"] = targets
     return metrics
 
 
@@ -1449,6 +1457,7 @@ def evaluate_power_latency_tradeoff(
         metrics = evaluate(model, loader, loss_fn, gamma=cfg.gamma_max, cfg=cfg,
                             threshold=threshold)
         diag = _diagnose_halt_vs_lambda_and_ap(model, loader, cfg, voltage_gate=1.0)
+        metrics = {k: v for k, v in metrics.items() if not k.startswith("_")}
         row = {"alpha": alpha, **metrics, **diag}
         results.append(row)
         window_str = " | ".join(
@@ -1641,7 +1650,7 @@ def main():
     )
 
     best_f1 = -1.0
-    best_score = -1.0
+    best_auprc = -1.0
     best_state = None
     run_record = {"config": asdict(cfg), "epochs": []}
 
@@ -1669,16 +1678,13 @@ def main():
         val_pf_thresh, val_pf_metrics = tune_threshold_for_precision_floor(
             model, val_loader, cfg, precision_floor=cfg.precision_floor,
         )
-        if val_pf_thresh is not None:
-            score = 1.0 + val_pf_metrics["recall"]
-            score_desc = f"recall={val_pf_metrics['recall']:.4f} @ precision>={cfg.precision_floor:.2f} (val)"
-        else:
-            score = val_pf_metrics["precision"]
-            score_desc = f"floor not reached, best val precision={val_pf_metrics['precision']:.4f}"
+        val_auprc = compute_val_auprc(val_metrics["_val_logits"], val_metrics["_val_targets"])
 
         run_record["epochs"].append({
             "epoch": epoch, "phase": phase, "gamma": gamma, "time_sec": dt,
-            "train_stats": train_stats, "val_metrics": val_metrics,
+            "train_stats": train_stats,
+            "val_metrics": {k: v for k, v in val_metrics.items() if not k.startswith("_")},
+            "val_auprc": val_auprc,
             "val_precision_floor_check": {"threshold": val_pf_thresh, "metrics": val_pf_metrics},
         })
         with open(metrics_path, "w") as f:
@@ -1687,11 +1693,11 @@ def main():
         if val_metrics["f1"] > best_f1:
             best_f1 = val_metrics["f1"]
 
-        if score > best_score:
-            best_score = score
+        if val_auprc > best_auprc:
+            best_auprc = val_auprc
             best_state = copy.deepcopy(model.state_dict())
             torch.save(best_state, checkpoint_path)
-            print(f"  -> new best checkpoint ({score_desc}), saved")
+            print(f"  -> new best val AUPRC ({best_auprc:.4f}), checkpoint saved")
 
     if best_state is not None:
         model.load_state_dict(best_state)
