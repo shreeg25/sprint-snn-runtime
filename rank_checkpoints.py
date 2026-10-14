@@ -11,15 +11,49 @@ Usage:
 """
 
 import argparse
+import dataclasses
 import glob
 import json
 import os
+
+import torch
+
+import train_halting_snn as ths
+
+CURRENT_KEYS = {f.name for f in dataclasses.fields(ths.HaltConfig)}
+
+
+def compatible(run, cfg_dict, build):
+    """True only if the run was made by the CURRENT script version: its config has
+    every field the current HaltConfig has, and its weights load strictly into
+    the current model. Older runs used different code (and a different val
+    metric path), so their val AUPRC is not comparable."""
+    missing = CURRENT_KEYS - set(cfg_dict) - {"device"}
+    if missing:
+        return False, f"config missing {sorted(missing)[:3]}"
+    cfg = ths.HaltConfig()
+    for k, v in cfg_dict.items():
+        if k in CURRENT_KEYS and k != "device":
+            setattr(cfg, k, tuple(v) if isinstance(v, list) else v)
+    cfg.device = "cpu"
+    try:
+        sd = torch.load(os.path.join(run, "best_model.pt"), map_location="cpu")
+        build(3, cfg).load_state_dict(sd, strict=True)
+    except Exception as e:
+        return False, f"weights don't fit current model ({type(e).__name__})"
+    return True, ""
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint_dir", default="checkpoints")
+    ap.add_argument("--since", default=None,
+                    help="Only runs at or after this id, e.g. run_20260910_000000")
+    ap.add_argument("--model_module", default=None,
+                    help="train_halting_lif for the spiking retrain")
     args = ap.parse_args()
+    build = __import__(args.model_module).build_model if args.model_module else ths.build_model
+    skipped = []
 
     rows = []
     for mj in glob.glob(os.path.join(args.checkpoint_dir, "run_*", "metrics.json")):
@@ -31,11 +65,18 @@ def main():
                 d = json.load(f)
         except (json.JSONDecodeError, OSError):
             continue
+        if args.since and os.path.basename(run) < args.since:
+            continue
         eps = d.get("epochs", [])
-        if not eps:
+        c = d.get("config", {})
+        if not eps or not any("val_auprc" in e for e in eps):
+            skipped.append((os.path.basename(run), "no val_auprc logged"))
+            continue
+        ok, why = compatible(run, c, build)
+        if not ok:
+            skipped.append((os.path.basename(run), why))
             continue
         best = max(eps, key=lambda e: e.get("val_auprc", -1))
-        c = d.get("config", {})
         rows.append({
             "run": os.path.basename(run),
             "val_auprc": best.get("val_auprc", float("nan")),
@@ -48,8 +89,13 @@ def main():
             "alpha": tuple(c.get("train_alpha_range", ())),
         })
 
+    if skipped:
+        print(f"Skipped {len(skipped)} incompatible/older runs:")
+        for r, why in sorted(skipped):
+            print(f"  {r}: {why}")
+        print()
     if not rows:
-        print("No runs with both metrics.json and best_model.pt found.")
+        print("No compatible runs found.")
         return
 
     rows.sort(key=lambda r: r["val_auprc"], reverse=True)
@@ -67,7 +113,8 @@ def main():
     print(f"\nTop by validation: {top['run']}")
     print(f"  python eval_sprint.py --checkpoint {args.checkpoint_dir}/{top['run']}/best_model.pt "
           f"--metrics_json {args.checkpoint_dir}/{top['run']}/metrics.json --data_dir data/raw "
-          f"--out_dir eval_{top['run']}")
+          f"--out_dir eval_{top['run']}"
+          + (f" --model_module {args.model_module}" if args.model_module else ""))
 
 
 if __name__ == "__main__":
