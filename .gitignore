@@ -1,4 +1,8 @@
 /.vscode
 /data
 /venv
-*\pycache*
+*\pycache*__pycache__/
+venv/
+data/
+checkpoints/
+checkpoints_lif/
