@@ -212,12 +212,18 @@ def main():
     ap.add_argument("--data_dir", default="data/raw")
     ap.add_argument("--out_dir", default="eval_out")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--pre_r", type=int, default=None,
+                    help="Samples before the R-peak where each window starts. Pass the SAME "
+                         "value used in training (default: the original midpoint, 50).")
     ap.add_argument("--model_module", default=None,
                     help="Optional module providing build_model(in_features, cfg) "
                          "(e.g. train_halting_lif for the retrained spiking model).")
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
+    if args.pre_r is not None:
+        import train_halting_lif
+        train_halting_lif.set_pre_r(args.pre_r)
     cfg = load_cfg(args.metrics_json, args.device)
     print(f"[EVAL] t_min={cfg.t_min} train_alpha_range={cfg.train_alpha_range} "
           f"alpha_grid={cfg.eval_alpha_grid} seed={cfg.seed}")
