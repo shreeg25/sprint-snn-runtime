@@ -23,6 +23,7 @@ Per-timestep hidden spike counts are kept in model.last_spikes (T, B) after
 each forward pass; eval_sprint.py uses them to report SOPs up to the exit.
 """
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -113,6 +114,35 @@ class SpikingHaltingSNN(ths.LIFHaltingSNN):
         return spike_trains, mem_trains, halt_probs
 
 
+def set_pre_r(pre_r):
+    """Beat windows start pre_r samples before the R-peak (default in
+    train_halting_snn: t_max // 2 = 50, i.e. R-peak at the window MIDPOINT).
+    With the R-peak at t=50, any exit before ~t=50 has not seen the QRS
+    complex yet. pre_r=20 puts the QRS near the start of the window, so an
+    early exit still sees it. Must be passed identically to training and eval."""
+    def __getitem__(self, idx):
+        signal = self.signals[self.record_of_beat[idx]]
+        start = max(0, self.peak_of_beat[idx] - pre_r)
+        segment = signal[start:start + self.t_max]
+        if len(segment) < self.t_max:
+            segment = np.pad(segment, (0, self.t_max - len(segment)), "constant")
+        x = torch.tensor(segment, dtype=torch.float32).unsqueeze(-1)
+        return x, torch.tensor(self.labels[idx], dtype=torch.long)
+    ths.MITBIHBeatDataset.__getitem__ = __getitem__
+    print(f"[SPRINT-LIF] Beat window starts {pre_r} samples before the R-peak", flush=True)
+
+
+def pop_pre_r(argv):
+    """Remove --pre_r N from argv (so the original argparse doesn't see it)."""
+    if "--pre_r" in argv:
+        i = argv.index("--pre_r")
+        val = int(argv[i + 1])
+        del argv[i:i + 2]
+        set_pre_r(val)
+        return val
+    return None
+
+
 def build_model(in_features, cfg):
     return SpikingHaltingSNN(
         hidden=cfg.hidden, t_max=cfg.t_max, beta=cfg.beta, v_max=cfg.v_max,
@@ -141,6 +171,7 @@ def _config_from_json(path):
 
 if __name__ == "__main__":
     import sys
+    pop_pre_r(sys.argv)
     if "--config_from" in sys.argv:
         i = sys.argv.index("--config_from")
         path = sys.argv[i + 1]
