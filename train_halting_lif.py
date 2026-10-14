@@ -121,6 +121,31 @@ def build_model(in_features, cfg):
     )
 
 
+_HaltConfigClass = ths.HaltConfig   # keep the real class; main() gets a factory below
+
+
+def _config_from_json(path):
+    """Start from the exact HaltConfig of an earlier run (its metrics.json),
+    so the retrain differs only in the model. CLI flags still override it."""
+    import dataclasses
+    import json
+    with open(path) as f:
+        saved = json.load(f).get("config", {})
+    cfg = _HaltConfigClass()
+    names = {fld.name for fld in dataclasses.fields(_HaltConfigClass)}
+    for k, v in saved.items():
+        if k in names and k != "device":
+            setattr(cfg, k, tuple(v) if isinstance(v, list) else v)
+    return cfg
+
+
 if __name__ == "__main__":
+    import sys
+    if "--config_from" in sys.argv:
+        i = sys.argv.index("--config_from")
+        path = sys.argv[i + 1]
+        del sys.argv[i:i + 2]
+        ths.HaltConfig = lambda: _config_from_json(path)   # main() calls HaltConfig() once
+        print(f"[SPRINT-LIF] Base config loaded from {path}", flush=True)
     ths.build_model = build_model   # main() looks this name up at call time
     ths.main()
