@@ -129,9 +129,21 @@ def soft_readout(class_mem, halt_probs, t_min):
     return (p_stop.unsqueeze(-1) * class_mem).sum(0), S.sum(0)
 
 
-def all_methods(halt_run, plain_run, t_min):
-    """Returns {method_name: (logits (N,2), latency (N,), from_halt_run: bool)}."""
+def all_methods(halt_run, plain_run, t_min, v_dd=None, v_emergency=0.05):
+    """Returns {method_name: (logits (N,2), latency (N,), from_halt_run: bool)}.
+    v_dd (N,T): if given, adds 'Budget truncate T=k': exit at step k OR at the
+    brownout step (V_dd < v_emergency), whichever comes first. This is the
+    non-learned, voltage-aware baseline a device could actually run; plain
+    truncation at k ignores that the device may have browned out before k."""
     out = _methods(halt_run, plain_run, t_min)
+    if v_dd is not None:
+        cm_p = plain_run[0]
+        T = cm_p.shape[0]
+        steps = torch.arange(1, T + 1).unsqueeze(1)          # (T,1)
+        brown = (v_dd.transpose(0, 1) < v_emergency)          # (T,N)
+        for k in TRUNC_STEPS:
+            ev = (steps >= min(k, T)) | brown
+            out[f"Budget truncate T={k}"] = first_event_readout(cm_p, ev)
     return {k: (lg, lat, k.startswith("SPRINT")) for k, (lg, lat) in out.items()}
 
 
@@ -225,9 +237,13 @@ def main():
     # Thresholds: chosen once per method on validation (random alpha, as in training).
     Xv, yv = materialize(val_loader.dataset)
     val_methods = all_methods(rollout(model, Xv, args.device),
-                              rollout(model, Xv, args.device, allow_halt=False), cfg.t_min)
+                              rollout(model, Xv, args.device, allow_halt=False), cfg.t_min,
+                              v_dd=Xv[:, :, -2], v_emergency=cfg.v_emergency)
     yv_np = yv.numpy()
     thresholds = {m: pick_threshold(pos_score(lg), yv_np) for m, (lg, _, _) in val_methods.items()}
+    budget = [m for m in val_methods if m.startswith("Budget truncate")]
+    best_budget = max(budget, key=lambda m: metrics_at(pos_score(val_methods[m][0]), yv_np, 0.5)["auroc"])
+    print(f"[EVAL] Budget truncation T chosen on validation AUROC: {best_budget}")
 
     # Test: random-alpha test set (same distribution as training) + fixed-alpha grid.
     test_sets = [("random", ths.MITBIHVoltageDataset(
@@ -243,7 +259,10 @@ def main():
         halt_run = rollout(model, Xt, args.device)
         plain_run = rollout(model, Xt, args.device, allow_halt=False)
         spiking = halt_run[3] is not None
-        methods = all_methods(halt_run, plain_run, cfg.t_min)
+        methods = all_methods(halt_run, plain_run, cfg.t_min,
+                              v_dd=Xt[:, :, -2], v_emergency=cfg.v_emergency)
+        methods[f"{best_budget} [T on val]"] = methods[best_budget]
+        thresholds[f"{best_budget} [T on val]"] = thresholds[best_budget]
         for name, (lg, lat, from_halt) in methods.items():
             m = metrics_at(pos_score(lg), yt_np, thresholds[name])
             sops, macs = compute_cost(lat, (halt_run if from_halt else plain_run)[3], cfg, spiking)
@@ -257,15 +276,16 @@ def main():
         w.writeheader()
         w.writerows(rows)
     with open(os.path.join(args.out_dir, "eval_results.json"), "w") as f:
-        json.dump({"checkpoint": args.checkpoint, "rows": rows}, f, indent=2)
+        clean = [{k: (None if isinstance(v, float) and v != v else v) for k, v in r.items()} for r in rows]
+        json.dump({"checkpoint": args.checkpoint, "rows": clean}, f, indent=2)
 
-    hdr = (f"{'alpha':>7} {'method':<30} {'T':>6} {'P':>6} {'R':>6} {'F1':>6} {'BalAcc':>7} "
+    hdr = (f"{'alpha':>7} {'method':<36} {'T':>6} {'P':>6} {'R':>6} {'F1':>6} {'BalAcc':>7} "
            f"{'AUROC':>6} {'AUPRC':>6} {'SOPs':>9} {'MACs':>9}")
     print(hdr)
     print("-" * len(hdr))
     for r in rows:
         a = r["alpha"] if isinstance(r["alpha"], str) else f"{r['alpha']:.3f}"
-        print(f"{a:>7} {r['method']:<30} {r['mean_latency']:6.1f} {r['precision']*100:6.1f} "
+        print(f"{a:>7} {r['method']:<36} {r['mean_latency']:6.1f} {r['precision']*100:6.1f} "
               f"{r['recall']*100:6.1f} {r['f1']*100:6.1f} {r['balanced_acc']*100:7.1f} "
               f"{r['auroc']*100:6.1f} {r['auprc']*100:6.1f} {r['mean_sops']:9.0f} {r['mean_macs']:9.0f}")
     print(f"[EVAL] Wrote {args.out_dir}/eval_results.csv and .json")
